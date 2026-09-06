@@ -13,7 +13,7 @@ use crate::ui::controls::{
     ModalTone, form_check_button, form_entry, form_label, message_dialog_description,
     message_dialog_layout, modal_layout,
 };
-use crate::ui::modal::{ModalHost, dismiss_modal_layer, modal_layer};
+use crate::ui::modal::{ModalHost, dismiss_modal_layer, modal_layer, submit_on_enter};
 use gtk::prelude::*;
 use gtk::{gio, glib};
 use std::cell::{Cell, RefCell};
@@ -152,6 +152,18 @@ impl ViewState {
         }
         self.resolve_undo_collisions(generation, collisions, accepted);
         true
+    }
+
+    pub(super) fn undo_copy(self: &Rc<Self>, generation: u64, locations: Vec<Location>) -> bool {
+        let existing = locations
+            .into_iter()
+            .filter(location_exists)
+            .collect::<Vec<_>>();
+        if existing.is_empty() {
+            self.browser.discard_pending_undo(generation);
+            return false;
+        }
+        self.browser.undo_copy(generation, existing)
     }
 
     fn resolve_undo_collisions(
@@ -565,8 +577,7 @@ impl ViewState {
                 }
             });
         });
-        let activate_confirm = confirm.clone();
-        field.connect_activate(move |_| activate_confirm.emit_clicked());
+        submit_on_enter(&layout.body, &confirm);
         let escape = gtk::EventControllerKey::new();
         let escape_layer = layer.clone();
         let escape_overlay = window_overlay;

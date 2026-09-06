@@ -21,6 +21,7 @@ mod scrolling;
 mod search;
 mod settings;
 mod shortcut_footer;
+mod terminal;
 mod theme;
 mod thumbnail;
 mod thumbnail_cache;
