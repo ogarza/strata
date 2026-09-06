@@ -1109,6 +1109,10 @@ impl Browser {
         self.state.borrow().selected_entries()
     }
 
+    pub fn selection_is_load_cursor(&self) -> bool {
+        self.state.borrow().selection_is_load_cursor()
+    }
+
     pub fn deletion_entries(&self) -> Vec<FileEntry> {
         let state = self.state.borrow();
         let selected = state.selected_entries();

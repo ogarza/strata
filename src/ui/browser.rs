@@ -897,7 +897,11 @@ impl BrowserView {
             .state
             .destination_depth()
             .and_then(|depth| self.state.browser.location_at(depth));
-        if let Some(location) = paste_destination(&selected, column) {
+        if let Some(location) = paste_destination(
+            &selected,
+            column,
+            self.state.browser.selection_is_load_cursor(),
+        ) {
             self.state.paste_into(location);
         }
     }
@@ -1377,9 +1381,13 @@ impl ViewState {
     }
 }
 
-fn paste_destination(selected: &[FileEntry], column: Option<Location>) -> Option<Location> {
+fn paste_destination(
+    selected: &[FileEntry],
+    column: Option<Location>,
+    load_cursor: bool,
+) -> Option<Location> {
     match selected {
-        [folder] if folder.is_directory() => Some(folder.location.clone()),
+        [folder] if folder.is_directory() && !load_cursor => Some(folder.location.clone()),
         _ => column,
     }
 }

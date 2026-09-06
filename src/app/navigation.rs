@@ -53,6 +53,9 @@ pub struct ColumnState {
     preferences: ViewPreferences,
     request_id: RequestId,
     select_first_on_load: bool,
+    /// Location auto-selected after a directory load, until the user picks
+    /// something else. Paste must not treat this folder as a destination.
+    load_cursor: Option<Location>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -181,6 +184,7 @@ impl NavigationState {
                 preferences,
                 request_id,
                 select_first_on_load: false,
+                load_cursor: None,
             })
             .collect();
         self.active_column = self.columns.len().checked_sub(1);
@@ -251,6 +255,7 @@ impl NavigationState {
             preferences: self.preferences,
             request_id,
             select_first_on_load: false,
+            load_cursor: None,
         });
     }
 
@@ -295,8 +300,9 @@ impl NavigationState {
                 column.selected = Some(position);
                 column.selected_locations.clear();
                 column.selected_locations.insert(location.clone());
-                column.selection_anchor = Some(location);
+                column.selection_anchor = Some(location.clone());
                 column.select_first_on_load = false;
+                column.load_cursor = Some(location);
             }
         }
         Some((depth, insertions))
@@ -329,8 +335,9 @@ impl NavigationState {
                 column.selected = Some(position);
                 column.selected_locations.clear();
                 column.selected_locations.insert(location.clone());
-                column.selection_anchor = Some(location);
+                column.selection_anchor = Some(location.clone());
                 column.select_first_on_load = false;
+                column.load_cursor = Some(location);
             }
         }
         Some(depth)
@@ -677,10 +684,10 @@ impl NavigationState {
         let Some(entry) = column.entries.get(position) else {
             return false;
         };
+        let location = entry.location.clone();
+        adopt_selected_locations(column, HashSet::from([location.clone()]));
         column.selected = Some(position);
-        column.selected_locations.clear();
-        column.selected_locations.insert(entry.location.clone());
-        column.selection_anchor = Some(entry.location.clone());
+        column.selection_anchor = Some(location);
         self.active_column = Some(depth);
         true
     }
@@ -701,10 +708,11 @@ impl NavigationState {
         {
             return false;
         }
-        column.selected_locations = positions
+        let locations = positions
             .iter()
             .map(|position| column.entries[*position].location.clone())
             .collect();
+        adopt_selected_locations(column, locations);
         column.selected = focused.filter(|position| positions.contains(position));
         if column.selection_anchor.is_none() {
             column.selection_anchor = column
@@ -770,10 +778,11 @@ impl NavigationState {
         let selected_positions: Vec<usize> = (start..=end)
             .filter(|&index| is_visible(&column.entries[index]))
             .collect();
-        column.selected_locations = selected_positions
+        let locations = selected_positions
             .iter()
             .map(|&index| column.entries[index].location.clone())
             .collect();
+        adopt_selected_locations(column, locations);
         column.selected = Some(focused);
         self.active_column = Some(depth);
         Some((depth, focused, selected_positions))
@@ -807,10 +816,11 @@ impl NavigationState {
             return None;
         }
         column.selection_anchor = Some(column.entries[order[start]].location.clone());
-        column.selected_locations = positions
+        let locations = positions
             .iter()
             .map(|position| column.entries[*position].location.clone())
             .collect();
+        adopt_selected_locations(column, locations);
         column.selected = Some(focused);
         self.active_column = Some(depth);
         Some(positions)
@@ -858,6 +868,16 @@ impl NavigationState {
             .collect()
     }
 
+    pub fn selection_is_load_cursor(&self) -> bool {
+        let Some(column) = self.active_column.and_then(|depth| self.columns.get(depth)) else {
+            return false;
+        };
+        let Some(cursor) = &column.load_cursor else {
+            return false;
+        };
+        column.selected_locations.len() == 1 && column.selected_locations.contains(cursor)
+    }
+
     pub fn move_selection(&mut self, direction: i32) -> Option<(usize, usize)> {
         let depth = self
             .active_column
@@ -874,6 +894,7 @@ impl NavigationState {
             column.selected = None;
             column.selected_locations.clear();
             column.selection_anchor = None;
+            column.load_cursor = None;
             return None;
         }
 
@@ -1077,12 +1098,20 @@ impl NavigationState {
 /// Collapses a column's selection onto a single entry and anchors further
 /// range selections there.
 fn focus_only(column: &mut ColumnState, position: usize) {
+    let location = column.entries[position].location.clone();
+    adopt_selected_locations(column, HashSet::from([location.clone()]));
     column.selected = Some(position);
-    column.selected_locations.clear();
-    column
-        .selected_locations
-        .insert(column.entries[position].location.clone());
-    column.selection_anchor = Some(column.entries[position].location.clone());
+    column.selection_anchor = Some(location);
+}
+
+fn adopt_selected_locations(column: &mut ColumnState, locations: HashSet<Location>) {
+    if let Some(cursor) = &column.load_cursor
+        && !locations.is_empty()
+        && !(locations.len() == 1 && locations.contains(cursor))
+    {
+        column.load_cursor = None;
+    }
+    column.selected_locations = locations;
 }
 
 fn apply_metadata_update(entry: &mut FileEntry, update: &MetadataUpdate) -> bool {

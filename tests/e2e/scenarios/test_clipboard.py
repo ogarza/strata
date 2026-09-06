@@ -43,6 +43,33 @@ def test_paste_targets_a_single_selected_directory(strata, mode):
     assert fixture.path("todo.txt").exists()
 
 
+@pytest.mark.parametrize("mode", ALL_MODES)
+def test_paste_into_parent_uses_the_current_directory(strata, mode):
+    fixture = strata.fixture
+    root = fixture.root.name
+
+    strata.open_directory("documents")
+    strata.select_entry("notes.txt")
+    strata.keyboard.press("ctrl+c")
+    strata.keyboard.press("alt+Up")
+    strata.wait_for_directory(root)
+    if mode != "Columns":
+        strata.wait(
+            lambda: strata.selected_names() == ["archive"],
+            "the parent load cursor to settle on the first folder",
+        )
+    strata.keyboard.press("ctrl+v")
+
+    strata.wait(
+        lambda: fixture.path("notes.txt").exists(),
+        "the copy to land in the parent directory",
+    )
+    assert not fixture.path("archive/notes.txt").exists(), (
+        "the auto-selected first folder must not steal the paste"
+    )
+    assert fixture.path("documents/notes.txt").exists()
+
+
 def test_paste_follows_a_child_column_opened_by_pointer(strata):
     fixture = strata.fixture
 
