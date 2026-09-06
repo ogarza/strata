@@ -43,6 +43,7 @@ fn pinning_requires_an_available_non_trash_directory() {
     let entry = |location, kind| FileEntry {
         location,
         native_name: "item".into(),
+        thumbnail_path: None,
         display_name: "item".into(),
         kind,
         size: crate::model::MetadataValue::Unknown,

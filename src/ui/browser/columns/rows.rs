@@ -478,6 +478,7 @@ pub(super) fn column_rows(
                 .map(|item| FileEntry {
                     location: Location::local(item.path.clone()),
                     native_name: item.path.file_name().unwrap_or_default().to_os_string(),
+                    thumbnail_path: None,
                     display_name: item.name.clone(),
                     kind: if item.is_directory {
                         EntryKind::Directory

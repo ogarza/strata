@@ -39,6 +39,7 @@ fn delete_confirmation_labels_distinguish_files_and_folders() {
     let file = FileEntry {
         location: Location::local("/fixture/file.txt"),
         native_name: "file.txt".into(),
+        thumbnail_path: None,
         display_name: "file.txt".into(),
         kind: crate::model::EntryKind::File,
         size: crate::model::MetadataValue::Known(10),
@@ -60,6 +61,7 @@ fn delete_confirmation_labels_distinguish_files_and_folders() {
 #[test]
 fn quick_preview_is_offered_only_for_supported_files() {
     let entry = |name: &str, kind| FileEntry {
+        thumbnail_path: None,
         location: Location::local(format!("/fixture/{name}")),
         native_name: name.into(),
         display_name: name.into(),
@@ -103,6 +105,7 @@ fn quick_preview_is_offered_only_for_supported_files() {
 #[test]
 fn printing_is_offered_for_text_code_images_and_pdfs() {
     let entry = |name: &str, kind| FileEntry {
+        thumbnail_path: None,
         location: Location::local(format!("/fixture/{name}")),
         native_name: name.into(),
         display_name: name.into(),
@@ -153,6 +156,7 @@ fn entry_model_value_encodes_hidden_state_and_preserves_display_name() {
     let visible = FileEntry {
         location: Location::local("/fixture/photo"),
         native_name: "photo".into(),
+        thumbnail_path: None,
         display_name: "photo".into(),
         kind: crate::model::EntryKind::File,
         size: crate::model::MetadataValue::Unknown,
@@ -163,6 +167,7 @@ fn entry_model_value_encodes_hidden_state_and_preserves_display_name() {
     let hidden = FileEntry {
         location: Location::local("/fixture/.config"),
         native_name: ".config".into(),
+        thumbnail_path: None,
         display_name: ".config".into(),
         kind: crate::model::EntryKind::Directory,
         size: crate::model::MetadataValue::Unknown,

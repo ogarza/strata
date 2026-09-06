@@ -10,6 +10,7 @@ fn multi_selection_summary_lists_at_most_three_names() {
     let entry = |name: &str| FileEntry {
         location: Location::local(format!("/fixture/{name}")),
         native_name: name.into(),
+        thumbnail_path: None,
         display_name: name.into(),
         kind: crate::model::EntryKind::File,
         size: crate::model::MetadataValue::Unknown,

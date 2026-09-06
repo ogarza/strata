@@ -9,6 +9,7 @@ fn duplicate_transfer_uses_the_selected_entries_parent() {
     let entry = |path: &str| FileEntry {
         location: Location::local(path),
         native_name: Path::new(path).file_name().unwrap_or_default().to_owned(),
+        thumbnail_path: None,
         display_name: path.to_owned(),
         kind: crate::model::EntryKind::File,
         size: crate::model::MetadataValue::Unknown,

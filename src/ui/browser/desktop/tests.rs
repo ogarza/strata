@@ -9,6 +9,7 @@ fn terminal_shortcut_prefers_one_selected_directory() {
     let entry = |name: &str, kind| FileEntry {
         location: Location::local(format!("/fixture/{name}")),
         native_name: name.into(),
+        thumbnail_path: None,
         display_name: name.into(),
         kind,
         size: crate::model::MetadataValue::Unknown,
