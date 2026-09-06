@@ -334,7 +334,8 @@ fn icons_scrolling_bind_still_requests_thumbnail_and_settle_fills_chrome() {
             };
             let card = crate::ui::icons_cell::new_card(64);
             super::apply_icons_entry(None, &card, &entry, &HashSet::new(), 64, true);
-            let (icon, label, _) = crate::ui::icons_cell::parts(&card).expect("icons card");
+            assert!(crate::ui::icons_cell::rename_field(&card).is_none());
+            let (icon, label) = crate::ui::icons_cell::parts(&card).expect("icons card");
             assert!(label.tooltip_text().is_none());
             assert!(!card.has_css_class("cut"));
             let context = gtk::glib::MainContext::default();

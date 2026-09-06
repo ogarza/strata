@@ -28,17 +28,9 @@ pub(super) fn new_card(slot: i32) -> gtk::Box {
     label.add_css_class("alternate-rename-label");
     configure_label(&label);
 
-    let field = gtk::Entry::new();
-    field.add_css_class("inline-rename");
-    crate::ui::accessibility::set_label(&field, "Rename");
-    field.set_width_chars(1);
-    field.set_hexpand(true);
-    field.set_visible(false);
-
     let labels = gtk::Overlay::new();
     labels.set_hexpand(true);
     labels.set_child(Some(&label));
-    labels.add_overlay(&field);
 
     card.append(&icon);
     card.append(&labels);
@@ -46,22 +38,38 @@ pub(super) fn new_card(slot: i32) -> gtk::Box {
     card
 }
 
-pub(super) fn parts(
-    card: &impl IsA<gtk::Widget>,
-) -> Option<(gtk::Image, gtk::Inscription, gtk::Entry)> {
+pub(super) fn parts(card: &impl IsA<gtk::Widget>) -> Option<(gtk::Image, gtk::Inscription)> {
     let icon = card.first_child()?.downcast::<gtk::Image>().ok()?;
     let labels = card.last_child()?.downcast::<gtk::Overlay>().ok()?;
     let label = labels.child()?.downcast::<gtk::Inscription>().ok()?;
+    Some((icon, label))
+}
+
+pub(super) fn rename_field(card: &impl IsA<gtk::Widget>) -> Option<gtk::Entry> {
+    let labels = card.last_child()?.downcast::<gtk::Overlay>().ok()?;
     let mut sibling = labels.first_child();
-    let mut field = None;
     while let Some(widget) = sibling {
         sibling = widget.next_sibling();
         if let Ok(entry) = widget.downcast::<gtk::Entry>() {
-            field = Some(entry);
-            break;
+            return Some(entry);
         }
     }
-    Some((icon, label, field?))
+    None
+}
+
+pub(super) fn ensure_rename_field(card: &impl IsA<gtk::Widget>) -> Option<gtk::Entry> {
+    if let Some(field) = rename_field(card) {
+        return Some(field);
+    }
+    let labels = card.last_child()?.downcast::<gtk::Overlay>().ok()?;
+    let field = gtk::Entry::new();
+    field.add_css_class("inline-rename");
+    crate::ui::accessibility::set_label(&field, "Rename");
+    field.set_width_chars(1);
+    field.set_hexpand(true);
+    field.set_visible(false);
+    labels.add_overlay(&field);
+    Some(field)
 }
 
 pub(super) fn set_slot(card: &gtk::Box, thumbnail_size: i32) {
@@ -70,7 +78,7 @@ pub(super) fn set_slot(card: &gtk::Box, thumbnail_size: i32) {
     if card.width_request() != width || card.height_request() != height {
         card.set_size_request(width, height);
     }
-    if let Some((icon, _, _)) = parts(card) {
+    if let Some((icon, _)) = parts(card) {
         super::thumbnail::ensure_image_slot(&icon, slot);
     }
     if let Some(labels) = card.last_child() {

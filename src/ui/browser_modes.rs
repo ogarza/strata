@@ -618,7 +618,7 @@ impl ModeViews {
             list.scroll_to(0, gtk::ListScrollFlags::FOCUS, None);
         }
         glib::idle_add_local_once(move || {
-            // Recycled ordinary cells also contain a hidden rename field at position zero.
+            // Icons cards create the field on the placeholder bind; list rows already have one.
             let field = bound_items.borrow().iter().find_map(|bound| {
                 let item = bound.item.upgrade()?;
                 if item.position() != 0 {
@@ -683,9 +683,16 @@ impl ModeViews {
         let Some(label) = descendant_with_class(&widget, "alternate-rename-label") else {
             return false;
         };
-        let Some(field) =
-            descendant_with_class(&widget, "inline-rename").and_downcast::<gtk::Entry>()
-        else {
+        let field = widget
+            .clone()
+            .downcast::<gtk::Box>()
+            .ok()
+            .filter(|card| card.has_css_class("icons-card"))
+            .and_then(|card| super::icons_cell::ensure_rename_field(&card))
+            .or_else(|| {
+                descendant_with_class(&widget, "inline-rename").and_downcast::<gtk::Entry>()
+            });
+        let Some(field) = field else {
             return false;
         };
         field.set_text(&entry.display_name);
@@ -1517,6 +1524,38 @@ struct ModeClickOptions {
     multiple_selection: Rc<Cell<bool>>,
 }
 
+fn install_icons_new_entry_handlers(
+    field: &gtk::Entry,
+    active: Rc<RefCell<Option<ActiveModeNewEntry>>>,
+    browser: Weak<Browser>,
+    location: Option<Location>,
+) {
+    if field.has_css_class("icons-new-entry-wired") {
+        return;
+    }
+    field.add_css_class("icons-new-entry-wired");
+    field.connect_changed(|field| {
+        super::browser::update_basename_validation(field);
+    });
+    let active_for_submit = active.clone();
+    let browser_for_submit = browser.clone();
+    let location_for_submit = location.clone();
+    field.connect_activate(move |field| {
+        submit_mode_new_entry(
+            &active_for_submit,
+            &browser_for_submit,
+            &location_for_submit,
+            field,
+        );
+    });
+    let focus = gtk::EventControllerFocus::new();
+    let field_for_leave = field.clone();
+    focus.connect_leave(move |_| {
+        submit_mode_new_entry(&active, &browser, &location, &field_for_leave);
+    });
+    field.add_controller(focus);
+}
+
 fn submit_mode_new_entry(
     active: &RefCell<Option<ActiveModeNewEntry>>,
     browser: &Weak<Browser>,
@@ -2125,44 +2164,13 @@ fn build_icons_view(
     let source_index_for_setup = context.source_index.clone();
     let transfers_for_setup = context.transfer.clone();
     let peek_for_setup = context.state.clone();
-    let active_for_setup = context.active_new_entry.clone();
     let thumbnail_size_for_setup = context.thumbnail_size.clone();
-    let folder_location = context.browser.location_at(depth);
     factory.connect_setup(move |_, item| {
         let Some(item) = item.downcast_ref::<gtk::ListItem>() else {
             return;
         };
         let thumbnail_size = icons_card_icon_slot(thumbnail_size_for_setup.get());
         let card = super::icons_cell::new_card(thumbnail_size);
-        let (_, _, field) = super::icons_cell::parts(&card).expect("icons card children");
-        field.connect_changed(|field| {
-            super::browser::update_basename_validation(field);
-        });
-        let active_for_submit = active_for_setup.clone();
-        let browser_for_submit = browser_for_setup.clone();
-        let location_for_submit = folder_location.clone();
-        field.connect_activate(move |field| {
-            submit_mode_new_entry(
-                &active_for_submit,
-                &browser_for_submit,
-                &location_for_submit,
-                field,
-            );
-        });
-        let focus = gtk::EventControllerFocus::new();
-        let active_for_leave = active_for_setup.clone();
-        let browser_for_leave = browser_for_setup.clone();
-        let location_for_leave = folder_location.clone();
-        let field_for_leave = field.clone();
-        focus.connect_leave(move |_| {
-            submit_mode_new_entry(
-                &active_for_leave,
-                &browser_for_leave,
-                &location_for_leave,
-                &field_for_leave,
-            );
-        });
-        field.add_controller(focus);
         install_preview_click(
             &card,
             item,
@@ -2209,6 +2217,8 @@ fn build_icons_view(
     let thumbnail_size_for_bind = context.thumbnail_size.clone();
     let entry_kind_for_bind = context.new_entry_is_directory.clone();
     let scrolling_for_bind = context.scrolling.clone();
+    let active_for_bind = context.active_new_entry.clone();
+    let location_for_bind = context.browser.location_at(depth);
     factory.connect_bind(move |_, item| {
         let Some(item) = item.downcast_ref::<gtk::ListItem>() else {
             return;
@@ -2216,7 +2226,7 @@ fn build_icons_view(
         let Some(card) = item.child().and_downcast::<gtk::Box>() else {
             return;
         };
-        let Some((icon, label, field)) = super::icons_cell::parts(&card) else {
+        let Some((icon, label)) = super::icons_cell::parts(&card) else {
             return;
         };
         let source_position = item
@@ -2253,6 +2263,15 @@ fn build_icons_view(
             crate::assets::set_primary_icon(&icon, icon_name);
             icon.set_opacity(1.0);
             label.set_visible(false);
+            let Some(field) = super::icons_cell::ensure_rename_field(&card) else {
+                return;
+            };
+            install_icons_new_entry_handlers(
+                &field,
+                active_for_bind.clone(),
+                browser_for_bind.clone(),
+                location_for_bind.clone(),
+            );
             field.set_visible(true);
         }
     });
@@ -4068,11 +4087,13 @@ fn apply_icons_entry(
     thumbnail_size: i32,
     scrolling: bool,
 ) {
-    let Some((icon, label, field)) = super::icons_cell::parts(card) else {
+    let Some((icon, label)) = super::icons_cell::parts(card) else {
         return;
     };
     label.set_visible(true);
-    field.set_visible(false);
+    if let Some(field) = super::icons_cell::rename_field(card) {
+        field.set_visible(false);
+    }
     if label.text().as_deref() != Some(entry.display_name.as_str()) {
         label.set_text(Some(&entry.display_name));
     }
@@ -4115,7 +4136,7 @@ fn refresh_icons_section(
         let Some(card) = bound.widget.upgrade().and_downcast::<gtk::Box>() else {
             return;
         };
-        let Some((icon, label, _)) = super::icons_cell::parts(&card) else {
+        let Some((icon, label)) = super::icons_cell::parts(&card) else {
             return;
         };
         let Some(item) = bound.item.upgrade() else {
