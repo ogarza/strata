@@ -726,8 +726,8 @@ impl BrowserView {
         });
     }
 
-    /// Groups Explorer and Grid entries under file-type headings. The Miller-column
-    /// mode is unaffected.
+    /// Groups Explorer entries under file-type headings. Grid and Miller-column
+    /// modes keep the preference but do not apply it.
     pub fn set_group_by_type(&self, enabled: bool) {
         self.state
             .mode_views

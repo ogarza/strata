@@ -61,6 +61,14 @@ pub enum BrowserMode {
     Explorer,
 }
 
+impl BrowserMode {
+    /// File-type headings are Explorer-only for now. Grid grouping is disabled
+    /// until a follow-up can restore per-type separators.
+    pub fn supports_type_grouping(self) -> bool {
+        matches!(self, Self::Explorer)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum BrowserDensity {
     #[default]
@@ -920,10 +928,8 @@ impl ModeViews {
         self.cancel_new_entry();
         self.cancel_rename();
         self.group_by_type = enabled;
-        match self.mode {
-            BrowserMode::Columns => {}
-            BrowserMode::Grid => self.rebuild_grid(),
-            BrowserMode::Explorer => self.rebuild_explorer(),
+        if self.mode.supports_type_grouping() {
+            self.rebuild_explorer();
         }
     }
 
@@ -1437,7 +1443,7 @@ impl ModeViews {
                 new_folder_state: self.new_folder_state.borrow().clone(),
                 thumbnail_size: self.grid_thumbnail_size.clone(),
                 active_new_entry: self.active_new_entry.clone(),
-                group_by_type: self.group_by_type,
+                group_by_type: false,
                 density: self.density,
             },
             depth,

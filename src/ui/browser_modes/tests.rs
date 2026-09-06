@@ -43,6 +43,13 @@ fn stored_click_counts_reject_unsupported_values() {
 }
 
 #[test]
+fn type_grouping_is_explorer_only() {
+    assert!(!BrowserMode::Columns.supports_type_grouping());
+    assert!(!BrowserMode::Grid.supports_type_grouping());
+    assert!(BrowserMode::Explorer.supports_type_grouping());
+}
+
+#[test]
 fn click_activation_defaults_follow_view_conventions() {
     assert_eq!(
         ClickActivation::default_for(BrowserMode::Columns),
