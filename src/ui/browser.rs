@@ -1247,6 +1247,7 @@ impl BrowserView {
             return false;
         };
         let page = super::scrolling::page(&view, &scroll);
+        self.state.mode_views.borrow().suppress_focus_scroll();
         self.state.browser.page_selection(direction, page.items);
         super::scrolling::reveal_selection(&view, &scroll, direction, &page);
         true

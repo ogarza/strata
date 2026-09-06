@@ -317,6 +317,9 @@ pub struct ModeViews {
     group_by_type: bool,
     grid_thumbnail_size: Rc<Cell<i32>>,
     focus_before_header: RefCell<Option<glib::WeakRef<gtk::Widget>>>,
+    /// Page Up/Down scrolls the viewport itself; skip the follow-up `scroll_to`
+    /// that `FocusChanged` would otherwise schedule from stale GridView estimates.
+    suppress_focus_scroll: Cell<bool>,
 }
 
 impl ModeViews {
@@ -389,6 +392,7 @@ impl ModeViews {
             group_by_type: false,
             grid_thumbnail_size: Rc::new(Cell::new(DEFAULT_GRID_THUMBNAIL_SIZE)),
             focus_before_header: RefCell::new(None),
+            suppress_focus_scroll: Cell::new(false),
         }
     }
 
@@ -1292,6 +1296,10 @@ impl ModeViews {
         .map(|position| (depth, position))
     }
 
+    pub fn suppress_focus_scroll(&self) {
+        self.suppress_focus_scroll.set(true);
+    }
+
     pub fn focus_visible_pane(&self, depth: usize) {
         if self.rename_is_active() || self.new_entry_is_active() {
             return;
@@ -1322,6 +1330,9 @@ impl ModeViews {
             for pane in self.panes_at(depth) {
                 pane.stack.grab_focus();
             }
+            return;
+        }
+        if self.suppress_focus_scroll.replace(false) {
             return;
         }
         let view = view.downgrade();
