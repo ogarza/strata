@@ -3529,7 +3529,7 @@ fn extract_7z_from_reader(
                     .map_err(|e| sevenz_rust2::Error::Other(e.to_string().into()))?;
             }
             progress.fetch_add(1, Ordering::Relaxed);
-            Ok(false)
+            Ok(true)
         },
     )
     .map_err(|e| e.to_string())?;
