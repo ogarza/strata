@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+mod spinner;
+
 use super::*;
 use crate::model::Location;
 use crate::ui::browser_modes::{ClickActivation, ClickCount};

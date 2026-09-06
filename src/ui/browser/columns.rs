@@ -391,11 +391,13 @@ impl ViewState {
                 .collect::<Vec<_>>();
             set_column_selections(column, &positions);
             if snapshot.loading {
+                cancel_column_spinner(column);
+                column.spinner.set_visible(true);
                 column.spinner.start();
                 column.presentation.show_loading();
             } else {
-                column.spinner.stop();
-                column.spinner.set_visible(false);
+                // Rebuilt, already-loaded columns receive no finish event to cancel the timer.
+                stop_column_spinner(column);
                 if let Some(message) = snapshot.error.as_deref() {
                     column
                         .presentation
