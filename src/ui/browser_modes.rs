@@ -14,6 +14,10 @@ use std::{
 
 use gtk::{gio, glib, prelude::*};
 
+pub(super) use super::icons_cell::{
+    ICONS_CARD_SPACING, MAX_ICONS_THUMBNAIL_SIZE, MIN_ICONS_THUMBNAIL_SIZE, icons_card_extent,
+    icons_card_icon_slot,
+};
 use crate::{
     app::{Browser, BrowserColumnSnapshot, BrowserEvent},
     model::{FileEntry, Location, MetadataValue, SortDirection, SortKey},
@@ -23,15 +27,7 @@ const LIST_COLUMN_WIDTHS: [i32; 5] = [160, 110, 90, 120, 150];
 const LIST_COLUMN_MIN_WIDTHS: [i32; 5] = [160, 80, 70, 80, 110];
 const DEFAULT_ICONS_THUMBNAIL_SIZE: i32 = 64;
 const SCROLL_SETTLE_DELAY: std::time::Duration = std::time::Duration::from_millis(80);
-/// Margin and padding an icon card adds around its own width.
-const ICONS_CARD_SPACING: i32 = 4;
 const FALLBACK_ICONS_COLUMN_WIDTH: i32 = 160;
-const MIN_ICONS_THUMBNAIL_SIZE: i32 = 64;
-const MAX_ICONS_THUMBNAIL_SIZE: i32 = 256;
-const ICONS_CARD_LABEL_CHARS: i32 = 16;
-const ICONS_CARD_LABEL_LINES: i32 = 2;
-const ICONS_CARD_LABEL_LINE_PX: i32 = 18;
-const ICONS_CARD_PAD_Y: i32 = 4;
 
 #[derive(Clone)]
 struct ListColumnLayout {
@@ -1814,7 +1810,6 @@ struct IconsContext {
     new_entry_is_directory: Rc<Cell<bool>>,
     source_index: SourceIndexMap,
     sections: Weak<RefCell<Vec<PaneSection>>>,
-    scrolling: Rc<Cell<bool>>,
     density: Cell<BrowserDensity>,
 }
 
@@ -1892,7 +1887,6 @@ fn build_icons_pane(
         new_entry_is_directory: new_entry_is_directory.clone(),
         source_index: source_index.clone(),
         sections: Rc::downgrade(&sections),
-        scrolling: Rc::new(Cell::new(false)),
         density: Cell::new(options.density),
     });
     let (root, pane_section, groups) = if options.group_by_type {
@@ -1986,7 +1980,6 @@ fn build_icons_pane(
         .build();
     scroll.add_css_class("fixed-scrollbar");
     close_thumbnail_popover_on_outside_scroll(&controls.thumbnail_popover, &scroll);
-    install_icons_scroll_settle(&scroll, &context);
     if let Some(groups) = groups.clone() {
         let context = Rc::downgrade(&context);
         scroll
@@ -2104,41 +2097,14 @@ fn build_icons_view(
     let peek_for_setup = context.state.clone();
     let active_for_setup = context.active_new_entry.clone();
     let thumbnail_size_for_setup = context.thumbnail_size.clone();
-    let scrolling_for_setup = context.scrolling.clone();
     let folder_location = context.browser.location_at(depth);
     factory.connect_setup(move |_, item| {
         let Some(item) = item.downcast_ref::<gtk::ListItem>() else {
             return;
         };
-        let card = gtk::Box::new(gtk::Orientation::Vertical, 3);
-        card.add_css_class("icons-card");
-        if !scrolling_for_setup.get() {
-            card.add_css_class("file-appear");
-            let weak_card = card.downgrade();
-            glib::idle_add_local_once(move || {
-                if let Some(card) = weak_card.upgrade() {
-                    card.remove_css_class("file-appear");
-                }
-            });
-        }
-        card.set_halign(gtk::Align::Fill);
-        card.set_valign(gtk::Align::Fill);
-        card.set_overflow(gtk::Overflow::Hidden);
         let thumbnail_size = icons_card_icon_slot(thumbnail_size_for_setup.get());
-        ensure_icons_card_slot(&card, thumbnail_size);
-        let icon = gtk::Image::new();
-        super::thumbnail::ensure_image_slot(&icon, thumbnail_size);
-        icon.add_css_class("icons-card-icon");
-        let label = gtk::Inscription::new(None);
-        label.add_css_class("icons-card-label");
-        label.add_css_class("alternate-rename-label");
-        configure_icons_card_label(&label);
-        let field = gtk::Entry::new();
-        field.add_css_class("inline-rename");
-        super::accessibility::set_label(&field, "Rename");
-        field.set_width_chars(1);
-        field.set_hexpand(true);
-        field.set_visible(false);
+        let card = super::icons_cell::new_card(thumbnail_size);
+        let (_, _, field) = super::icons_cell::parts(&card).expect("icons card children");
         field.connect_changed(|field| {
             super::browser::update_basename_validation(field);
         });
@@ -2167,13 +2133,6 @@ fn build_icons_view(
             );
         });
         field.add_controller(focus);
-        let name = gtk::Overlay::new();
-        name.set_hexpand(true);
-        name.set_height_request(ICONS_CARD_LABEL_LINE_PX * ICONS_CARD_LABEL_LINES);
-        name.set_child(Some(&label));
-        name.add_overlay(&field);
-        card.append(&icon);
-        card.append(&name);
         install_preview_click(
             &card,
             item,
@@ -2208,11 +2167,14 @@ fn build_icons_view(
             None,
         );
         item.set_child(Some(&card));
+        if let Some(parent) = card.parent() {
+            parent.set_halign(gtk::Align::Center);
+            parent.set_valign(gtk::Align::Start);
+        }
         register_bound_mode_item(&bound_items_for_setup, item, &card);
     });
     let browser_for_bind = Rc::downgrade(&context.browser);
     let source_index_for_bind = context.source_index.clone();
-    let scrolling_for_bind = context.scrolling.clone();
     let cuts_for_bind = context.cuts.clone();
     let thumbnail_size_for_bind = context.thumbnail_size.clone();
     let entry_kind_for_bind = context.new_entry_is_directory.clone();
@@ -2223,7 +2185,7 @@ fn build_icons_view(
         let Some(card) = item.child().and_downcast::<gtk::Box>() else {
             return;
         };
-        let Some((icon, label, field)) = icons_card_parts(&card) else {
+        let Some((icon, label, field)) = super::icons_cell::parts(&card) else {
             return;
         };
         let source_position = item
@@ -2234,32 +2196,29 @@ fn build_icons_view(
             source_position.and_then(|position| browser.entry_at(depth, position))
         });
         let thumbnail_size = icons_card_icon_slot(thumbnail_size_for_bind.get());
-        ensure_icons_card_slot(&card, thumbnail_size);
-        super::thumbnail::ensure_image_slot(&icon, thumbnail_size);
+        super::icons_cell::set_slot(&card, thumbnail_size);
         if let Some(entry) = entry {
             label.set_visible(true);
             field.set_visible(false);
             if label.text().as_deref() != Some(entry.display_name.as_str()) {
                 label.set_text(Some(&entry.display_name));
             }
+            label.set_tooltip_text(Some(&entry.display_name));
             super::accessibility::describe_entry(item, &entry.display_name, Some(&entry));
-            if !scrolling_for_bind.get() {
-                set_mode_cut_style(&card, cuts_for_bind.borrow().contains(&entry.location));
-                label.set_tooltip_text(Some(&entry.display_name));
-                super::thumbnail::set_thumbnail_or_icon(
-                    &icon,
-                    &entry,
-                    super::browser::entry_icon(&entry),
-                    thumbnail_size,
-                    thumbnail_size,
-                );
-                if let Some(position) = metadata_fill_position(source_position, &entry, false)
-                    && let Some(browser) = browser.as_ref()
-                {
-                    browser.request_metadata_fill(depth, position, entry.location.clone());
-                }
-                icon.set_opacity(if entry.is_directory() { 1.0 } else { 0.72 });
+            set_mode_cut_style(&card, cuts_for_bind.borrow().contains(&entry.location));
+            super::thumbnail::set_thumbnail_or_icon(
+                &icon,
+                &entry,
+                super::browser::entry_icon(&entry),
+                thumbnail_size,
+                thumbnail_size,
+            );
+            if let Some(position) = metadata_fill_position(source_position, &entry, false)
+                && let Some(browser) = browser.as_ref()
+            {
+                browser.request_metadata_fill(depth, position, entry.location.clone());
             }
+            icon.set_opacity(if entry.is_directory() { 1.0 } else { 0.72 });
         } else {
             set_mode_cut_style(&card, false);
             let icon_name = if entry_kind_for_bind.get() {
@@ -2267,7 +2226,6 @@ fn build_icons_view(
             } else {
                 crate::assets::icons::DOCUMENTS
             };
-            super::thumbnail::ensure_image_slot(&icon, thumbnail_size);
             crate::assets::set_primary_icon(&icon, icon_name);
             icon.set_opacity(1.0);
             label.set_visible(false);
@@ -2448,16 +2406,6 @@ fn refresh_marquee_targets(pane: &Pane) {
         .collect();
 }
 
-fn install_icons_scroll_settle(scroll: &gtk::ScrolledWindow, context: &Rc<IconsContext>) {
-    let scrolling = context.scrolling.clone();
-    let context = Rc::downgrade(context);
-    install_scroll_settle(scroll, scrolling, "icons-fast-scroll", move || {
-        if let Some(context) = context.upgrade() {
-            refresh_icons_expensive_content(&context);
-        }
-    });
-}
-
 fn install_scroll_settle(
     scroll: &gtk::ScrolledWindow,
     scrolling: Rc<Cell<bool>>,
@@ -2502,98 +2450,14 @@ fn install_scroll_settle(
     }
 }
 
-fn refresh_icons_expensive_content(context: &IconsContext) {
-    let Some(sections) = context.sections.upgrade() else {
-        return;
-    };
-    let cuts = context.cuts.borrow();
-    for section in sections.borrow().iter() {
-        refresh_icons_section(
-            &Rc::downgrade(&context.browser),
-            context.depth,
-            &context.source_index,
-            section,
-            context.thumbnail_size.get(),
-            true,
-            Some(&cuts),
-        );
-    }
-}
-
 fn resize_icons_thumbnail_slots(section: &PaneSection, size: i32) {
     let size = icons_card_icon_slot(size);
     section.bound_items.borrow().iter().for_each(|bound| {
         let Some(card) = bound.widget.upgrade().and_downcast::<gtk::Box>() else {
             return;
         };
-        let Some((icon, _, _)) = icons_card_parts(&card) else {
-            return;
-        };
-        super::thumbnail::ensure_image_slot(&icon, size);
-        ensure_icons_card_slot(&card, size);
+        super::icons_cell::set_slot(&card, size);
     });
-}
-
-fn refresh_icons_section(
-    browser: &Weak<Browser>,
-    depth: usize,
-    source_index: &SourceIndexMap,
-    section: &PaneSection,
-    size: i32,
-    request_metadata: bool,
-    cuts: Option<&HashSet<Location>>,
-) {
-    let Some(browser) = browser.upgrade() else {
-        return;
-    };
-    let size = icons_card_icon_slot(size);
-    section.bound_items.borrow().iter().for_each(|bound| {
-        let Some(card) = bound.widget.upgrade().and_downcast::<gtk::Box>() else {
-            return;
-        };
-        let Some((icon, label, _)) = icons_card_parts(&card) else {
-            return;
-        };
-        super::thumbnail::ensure_image_slot(&icon, size);
-        ensure_icons_card_slot(&card, size);
-        let Some(item) = bound.item.upgrade() else {
-            return;
-        };
-        let Some(position) = item.item().and_then(|value| source_index.of_item(&value)) else {
-            return;
-        };
-        let Some(entry) = browser.entry_at(depth, position) else {
-            return;
-        };
-        super::thumbnail::set_thumbnail_or_icon(
-            &icon,
-            &entry,
-            super::browser::entry_icon(&entry),
-            size,
-            size,
-        );
-        if request_metadata {
-            label.set_tooltip_text(Some(&entry.display_name));
-            if let Some(cuts) = cuts {
-                set_mode_cut_style(&card, cuts.contains(&entry.location));
-            }
-            if let Some(position) = metadata_fill_position(Some(position), &entry, false) {
-                browser.request_metadata_fill(depth, position, entry.location.clone());
-            }
-        }
-        icon.set_opacity(if entry.is_directory() { 1.0 } else { 0.72 });
-    });
-}
-
-fn icons_card_icon_slot(thumbnail_size: i32) -> i32 {
-    thumbnail_size.clamp(MIN_ICONS_THUMBNAIL_SIZE, MAX_ICONS_THUMBNAIL_SIZE)
-}
-
-fn icons_card_extent(thumbnail_size: i32) -> (i32, i32) {
-    let slot = icons_card_icon_slot(thumbnail_size);
-    let width = slot.max(FALLBACK_ICONS_COLUMN_WIDTH - ICONS_CARD_SPACING);
-    let height = slot + ICONS_CARD_LABEL_LINE_PX * ICONS_CARD_LABEL_LINES + ICONS_CARD_PAD_Y + 3;
-    (width, height)
 }
 
 fn ensure_icons_card_slot(card: &gtk::Box, thumbnail_size: i32) {
@@ -2601,27 +2465,6 @@ fn ensure_icons_card_slot(card: &gtk::Box, thumbnail_size: i32) {
     if card.width_request() != width || card.height_request() != height {
         card.set_size_request(width, height);
     }
-}
-
-fn configure_icons_card_label(label: &gtk::Inscription) {
-    let chars = ICONS_CARD_LABEL_CHARS as u32;
-    let lines = ICONS_CARD_LABEL_LINES as u32;
-    label.set_min_chars(chars);
-    label.set_nat_chars(chars);
-    label.set_min_lines(lines);
-    label.set_nat_lines(lines);
-    label.set_xalign(0.5);
-    label.set_yalign(0.0);
-    label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
-    label.set_text_overflow(gtk::InscriptionOverflow::EllipsizeEnd);
-}
-
-fn icons_card_parts(card: &gtk::Box) -> Option<(gtk::Image, gtk::Inscription, gtk::Entry)> {
-    let icon = card.first_child()?.downcast::<gtk::Image>().ok()?;
-    let name = icon.next_sibling()?.downcast::<gtk::Overlay>().ok()?;
-    let label = name.child()?.downcast::<gtk::Inscription>().ok()?;
-    let field = name.last_child()?.downcast::<gtk::Entry>().ok()?;
-    Some((icon, label, field))
 }
 
 fn configure_icons_density(pane: &Pane, density: BrowserDensity) {
@@ -3499,7 +3342,7 @@ fn widget_or_ancestor_has_class(widget: &gtk::Widget, class: &str) -> bool {
 }
 
 fn install_icons_peek(
-    card: &gtk::Box,
+    card: &impl IsA<gtk::Widget>,
     item: &gtk::ListItem,
     state: Option<Weak<super::browser::ViewState>>,
     browser: Weak<Browser>,
@@ -3510,6 +3353,7 @@ fn install_icons_peek(
     let Some(state) = state else {
         return;
     };
+    let card = card.as_ref();
     let motion = gtk::EventControllerMotion::new();
     let entered_item = item.downgrade();
     let state_for_enter = state.clone();
@@ -3573,7 +3417,7 @@ fn install_mode_directory_drop_target(
 }
 
 fn install_list_drag_drop(
-    row: &gtk::Box,
+    row: &impl IsA<gtk::Widget>,
     item: &gtk::ListItem,
     browser: Weak<Browser>,
     transfer_handler: TransferHandlerSlot,
@@ -3584,6 +3428,7 @@ fn install_list_drag_drop(
     if transfer_handler.borrow().is_none() {
         return;
     }
+    let row = row.as_ref();
     let drag = gtk::DragSource::builder()
         .actions(gtk::gdk::DragAction::COPY | gtk::gdk::DragAction::MOVE)
         .build();

@@ -7,7 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use gtk::glib;
+use gtk::{gdk, glib};
 
 use super::{
     ACTIVE_REQUESTS, ActiveRequest, CacheHit, CachedThumbnail, MAX_CACHE_ENTRIES,
@@ -60,16 +60,39 @@ fn recognizes_mainstream_image_and_video_formats() {
     );
 }
 
+fn sample_texture() -> gdk::Texture {
+    // 1×1 transparent PNG.
+    const PNG: &[u8] = &[
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F,
+        0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00,
+        0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49,
+        0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+    ];
+    gdk::Texture::from_bytes(&glib::Bytes::from_static(PNG)).expect("1x1 PNG texture")
+}
+
 #[test]
 fn thumbnail_cache_evicts_the_least_recent_entry() {
     let mut cache = ThumbnailCache::default();
     for index in 0..=MAX_CACHE_ENTRIES {
-        cache.insert(key(index), glib::Bytes::from_static(&[1]));
+        cache.insert(key(index), sample_texture());
     }
 
     let oldest = key(0);
     assert!(cache.get(&oldest).is_none());
     assert_eq!(cache.entries.len(), MAX_CACHE_ENTRIES);
+}
+
+#[test]
+fn thumbnail_cache_hits_reuse_the_decoded_texture() {
+    let texture = sample_texture();
+    let mut cache = ThumbnailCache::default();
+    cache.insert(key(0), texture.clone());
+    match cache.get(&key(0)) {
+        Some(CacheHit::Ready(hit)) => assert_eq!(hit, texture),
+        _ => panic!("expected a cached texture"),
+    }
 }
 
 #[test]

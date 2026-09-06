@@ -2872,11 +2872,16 @@ colorchooser colorswatch overlay {
 }
 
 .file-row,
-.icons-card,
 .list-row {
   outline: 1px solid transparent;
   outline-offset: -1px;
   transition: background 220ms ease-out, color 180ms ease-out, outline-color 220ms ease-out, transform 200ms cubic-bezier(0.2, 0.9, 0.3, 1.2), opacity 200ms ease-out;
+}
+
+.icons-card {
+  outline: 1px solid transparent;
+  outline-offset: -1px;
+  transition: background 220ms ease-out, outline-color 220ms ease-out;
 }
 
 .file-row {

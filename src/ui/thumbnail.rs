@@ -208,12 +208,12 @@ struct ThumbnailCache {
 
 #[derive(Clone)]
 enum CachedThumbnail {
-    Ready(glib::Bytes),
+    Ready(gdk::Texture),
     Failed(Instant),
 }
 
 enum CacheHit {
-    Ready(glib::Bytes),
+    Ready(gdk::Texture),
     Failed,
 }
 
@@ -227,13 +227,13 @@ impl ThumbnailCache {
         self.recent.retain(|candidate| candidate != key);
         self.recent.push_back(key.clone());
         Some(match entry {
-            CachedThumbnail::Ready(bytes) => CacheHit::Ready(bytes),
+            CachedThumbnail::Ready(texture) => CacheHit::Ready(texture),
             CachedThumbnail::Failed(_) => CacheHit::Failed,
         })
     }
 
-    fn insert(&mut self, key: ThumbnailKey, bytes: glib::Bytes) {
-        self.insert_entry(key, CachedThumbnail::Ready(bytes));
+    fn insert(&mut self, key: ThumbnailKey, texture: gdk::Texture) {
+        self.insert_entry(key, CachedThumbnail::Ready(texture));
     }
 
     fn insert_failure(&mut self, key: ThumbnailKey) {
@@ -269,7 +269,10 @@ impl ThumbnailCache {
 impl CachedThumbnail {
     fn byte_len(&self) -> usize {
         match self {
-            Self::Ready(bytes) => bytes.len(),
+            Self::Ready(texture) => {
+                (texture.width().max(0) as usize).saturating_mul(texture.height().max(0) as usize)
+                    * 4
+            }
             Self::Failed(_) => 0,
         }
     }
@@ -409,10 +412,12 @@ fn set_thumbnail_for_path(request: ThumbnailRequest<'_>) {
     };
     // Disk validation moves to fire time so offscreen rows never touch the disk.
     match THUMBNAIL_CACHE.with(|cache| cache.borrow_mut().get(&key)) {
-        Some(CacheHit::Ready(bytes)) => {
+        Some(CacheHit::Ready(texture)) => {
             cancel_thumbnail(request.image.as_ptr() as usize);
-            ensure_image_slot(request.image, thumbnail_size);
-            apply_thumbnail(request.image, &bytes, &path);
+            if displayed_thumbnail_matches(request.image, request.path) {
+                return;
+            }
+            apply_thumbnail(request.image, &texture, &path);
             return;
         }
         Some(CacheHit::Failed) => {
@@ -757,8 +762,8 @@ fn fire_parks(mut drained: Vec<SettledPark>, viewport: Option<&gtk::ScrolledWind
             && let Some(hit) = THUMBNAIL_CACHE.with(|cache| cache.borrow_mut().get(&park.key))
         {
             match hit {
-                CacheHit::Ready(bytes) => {
-                    apply_thumbnail(image, &bytes, &park.key.path);
+                CacheHit::Ready(texture) => {
+                    apply_thumbnail(image, &texture, &park.key.path);
                 }
                 CacheHit::Failed => {}
             }
@@ -947,7 +952,6 @@ async fn run_thumbnail_job(job: ThumbnailJob) {
         {
             return Ok((png, false));
         }
-        // Render the canonical size class: one entry per file, so a small view must never poison the bucket.
         render_thumbnail(
             &job.key.path,
             job.kind,
@@ -963,10 +967,14 @@ async fn run_thumbnail_job(job: ThumbnailJob) {
         match result {
             Ok(Ok((png, rendered))) => {
                 crate::metrics::mark_thumbnail_completed();
-                let bytes = glib::Bytes::from_owned(png.clone());
-                THUMBNAIL_CACHE.with(|cache| cache.borrow_mut().insert(key.clone(), bytes.clone()));
-                finish_thumbnail_targets(targets, Some(&bytes), &path);
-                // Unverifiable keys (unknown mtime) skip persistence: nothing validates them later.
+                let texture = gdk::Texture::from_bytes(&glib::Bytes::from_owned(png.clone())).ok();
+                if let Some(texture) = texture {
+                    THUMBNAIL_CACHE
+                        .with(|cache| cache.borrow_mut().insert(key.clone(), texture.clone()));
+                    finish_thumbnail_targets(targets, Some(&texture), &path);
+                } else {
+                    finish_thumbnail_targets(targets, None, &path);
+                }
                 if rendered && let Some(mtime) = key.modified {
                     enqueue_persist(key.path.clone(), mtime, png);
                 }
@@ -1054,7 +1062,11 @@ fn take_pending_targets(key: &ThumbnailKey, job_id: u64) -> Option<Vec<PendingTa
     })
 }
 
-fn finish_thumbnail_targets(targets: Vec<PendingTarget>, bytes: Option<&glib::Bytes>, path: &Path) {
+fn finish_thumbnail_targets(
+    targets: Vec<PendingTarget>,
+    texture: Option<&gdk::Texture>,
+    path: &Path,
+) {
     for target in targets {
         let is_current = ACTIVE_REQUESTS.with(|requests| {
             let mut requests = requests.borrow_mut();
@@ -1072,14 +1084,14 @@ fn finish_thumbnail_targets(targets: Vec<PendingTarget>, bytes: Option<&glib::By
             crate::metrics::mark_thumbnail_stale();
             continue;
         }
-        let Some(bytes) = bytes else {
+        let Some(texture) = texture else {
             continue;
         };
         let Some(image) = target.image.upgrade() else {
             crate::metrics::mark_thumbnail_stale();
             continue;
         };
-        apply_thumbnail(&image, bytes, path);
+        apply_thumbnail(&image, texture, path);
         crate::metrics::mark_thumbnail_applied();
     }
 }
@@ -1091,17 +1103,11 @@ fn known_metadata<T: Copy>(value: &MetadataValue<T>) -> Option<T> {
     }
 }
 
-fn apply_thumbnail(image: &gtk::Image, bytes: &glib::Bytes, path: &Path) {
-    if let Ok(texture) = gdk::Texture::from_bytes(bytes) {
-        crate::assets::remove_primary_icon(image);
-        image.set_paintable(Some(&texture));
-        let slot = image.pixel_size();
-        if slot > 0 {
-            ensure_image_slot(image, slot);
-        }
-        image.set_opacity(1.0);
-        register_displayed_thumbnail(image, path);
-    }
+fn apply_thumbnail(image: &gtk::Image, texture: &gdk::Texture, path: &Path) {
+    crate::assets::remove_primary_icon(image);
+    image.set_paintable(Some(texture));
+    image.set_opacity(1.0);
+    register_displayed_thumbnail(image, path);
 }
 
 fn displayed_thumbnail_matches(image: &gtk::Image, path: &Path) -> bool {
