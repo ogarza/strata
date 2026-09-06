@@ -13,11 +13,17 @@ use super::{
     ACTIVE_REQUESTS, ActiveRequest, CacheHit, CachedThumbnail, MAX_CACHE_ENTRIES,
     MAX_PERSIST_QUEUE, MAX_QUEUED_THUMBNAILS, MAX_THUMBNAIL_WORKERS, METADATA_WAITERS,
     MetadataWaiter, PENDING_THUMBNAILS, PendingTarget, PendingThumbnail, PersistJob, PersistQueue,
-    SETTLE_VIEWS, SettledPark, THUMBNAIL_QUEUE, ThumbnailCache, ThumbnailKey, ThumbnailKind,
-    ThumbnailQueue, ViewSettle, cancel_thumbnail, finish_thumbnail_targets,
-    fire_settled_thumbnails, note_metadata, retry_deferred_thumbnail, schedule_or_defer,
-    take_pending_targets, thumbnail_kind,
+    SETTLE_VIEWS, SettledPark, THUMBNAIL_CACHE, THUMBNAIL_QUEUE, ThumbnailCache, ThumbnailKey,
+    ThumbnailKind, ThumbnailQueue, ViewSettle, cancel_thumbnail, clear_thumbnail_runtime,
+    finish_thumbnail_targets, fire_settled_thumbnails, has_pending_thumbnail,
+    hold_thumbnail_workers, note_metadata, retry_deferred_thumbnail, schedule_or_defer,
+    set_thumbnail_or_icon, take_pending_targets, thumbnail_kind,
 };
+use crate::{
+    model::{EntryKind, FileEntry, Location, MetadataValue},
+    test_support::gtk_test,
+};
+use gtk::prelude::*;
 
 fn key(index: usize) -> ThumbnailKey {
     ThumbnailKey {
@@ -482,4 +488,137 @@ fn persist_queue_bounds_and_drains_oldest_first() {
         drained += 1;
     }
     assert_eq!(drained, MAX_PERSIST_QUEUE);
+}
+
+fn sample_entry(path: &Path) -> FileEntry {
+    FileEntry {
+        location: Location::local(path),
+        thumbnail_path: None,
+        native_name: path
+            .file_name()
+            .map_or_else(Default::default, |name| name.to_os_string()),
+        display_name: path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        kind: EntryKind::File,
+        size: MetadataValue::Known(1),
+        modified_unix_seconds: MetadataValue::Known(1),
+        mode: MetadataValue::Known(0o100644),
+        is_hidden: false,
+    }
+}
+
+fn drain_main_loop() {
+    let context = glib::MainContext::default();
+    for _ in 0..64 {
+        if !context.iteration(false) {
+            break;
+        }
+    }
+}
+
+fn displayed_texture(image: &gtk::Image) -> Option<gdk::Texture> {
+    image.paintable()?.downcast::<gdk::Texture>().ok()
+}
+
+fn bind_thumbnail(image: &gtk::Image, entry: &FileEntry) {
+    set_thumbnail_or_icon(image, entry, crate::assets::icons::PICTURES, 64, 64);
+}
+
+#[test]
+fn cache_hit_applies_texture_on_idle_not_during_bind() {
+    gtk_test(
+        "ui::thumbnail::tests::cache_hit_applies_texture_on_idle_not_during_bind",
+        || {
+            super::super::theme::ThemeManager::shared();
+            let path = PathBuf::from("/fixture/cache-hit.png");
+            let texture = sample_texture();
+            THUMBNAIL_CACHE.with(|cache| {
+                cache.borrow_mut().insert(
+                    ThumbnailKey {
+                        path: path.clone(),
+                        modified: Some(1),
+                        file_size: Some(1),
+                        thumbnail_size: 64,
+                    },
+                    texture.clone(),
+                );
+            });
+            let image = gtk::Image::new();
+            bind_thumbnail(&image, &sample_entry(&path));
+            assert_ne!(displayed_texture(&image).as_ref(), Some(&texture));
+            drain_main_loop();
+            assert_eq!(displayed_texture(&image).as_ref(), Some(&texture));
+            clear_thumbnail_runtime();
+        },
+    );
+}
+
+#[test]
+fn cache_miss_enqueues_sandbox_job_without_settle_timeout() {
+    gtk_test(
+        "ui::thumbnail::tests::cache_miss_enqueues_sandbox_job_without_settle_timeout",
+        || {
+            super::super::theme::ThemeManager::shared();
+            hold_thumbnail_workers();
+            let path = PathBuf::from("/fixture/cache-miss.png");
+            let image = gtk::Image::new();
+            bind_thumbnail(&image, &sample_entry(&path));
+            drain_main_loop();
+            assert!(has_pending_thumbnail(&path));
+            SETTLE_VIEWS.with(|views| {
+                let views = views.borrow();
+                if let Some(settle) = views.get(&0) {
+                    assert!(settle.timer.is_none());
+                    assert!(settle.pending.is_empty());
+                }
+            });
+            clear_thumbnail_runtime();
+        },
+    );
+}
+
+#[test]
+fn stale_request_id_does_not_apply_completed_texture() {
+    gtk_test(
+        "ui::thumbnail::tests::stale_request_id_does_not_apply_completed_texture",
+        || {
+            super::super::theme::ThemeManager::shared();
+            let path = PathBuf::from("/fixture/stale.png");
+            let image = gtk::Image::new();
+            let image_id = image.as_ptr() as usize;
+            let weak = glib::WeakRef::new();
+            weak.set(Some(&image));
+            ACTIVE_REQUESTS.with(|requests| {
+                requests.borrow_mut().insert(
+                    image_id,
+                    ActiveRequest {
+                        id: 2,
+                        image: weak.clone(),
+                        deferred: None,
+                    },
+                );
+            });
+            let texture = sample_texture();
+            finish_thumbnail_targets(
+                vec![PendingTarget {
+                    image_id,
+                    request: 1,
+                    image: weak,
+                }],
+                Some(&texture),
+                &path,
+            );
+            drain_main_loop();
+            assert_ne!(displayed_texture(&image).as_ref(), Some(&texture));
+            ACTIVE_REQUESTS.with(|requests| {
+                assert_eq!(
+                    requests.borrow().get(&image_id).map(|active| active.id),
+                    Some(2)
+                );
+            });
+            clear_thumbnail_runtime();
+        },
+    );
 }

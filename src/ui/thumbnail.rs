@@ -22,10 +22,11 @@ const MAX_CACHE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_THUMBNAIL_WORKERS: usize = 4;
 const MAX_QUEUED_THUMBNAILS: usize = 64;
 const FAILED_THUMBNAIL_TTL: Duration = Duration::from_secs(30);
-/// Settles scrolling before decoding; cache hits bypass the gate.
+/// Scroll callbacks re-arm this delay so leftover parks are not fired inside layout.
 const THUMBNAIL_SETTLE_DELAY: Duration = Duration::from_millis(120);
-/// Bounds starvation: overlong parks fire anyway, still viewport-intersected.
+/// Overlong parks still admit sandbox jobs on a long fling; they do not apply textures.
 const MAX_SETTLE_WAIT: Duration = Duration::from_millis(400);
+#[cfg(test)]
 const VIEWPORT_OVERSCAN: f32 = 0.25;
 
 thread_local! {
@@ -69,6 +70,7 @@ struct DeferredThumbnail {
     kind: ThumbnailKind,
 }
 
+#[derive(Clone)]
 struct PendingTarget {
     image_id: usize,
     request: u64,
@@ -404,20 +406,26 @@ fn set_thumbnail_for_path(request: ThumbnailRequest<'_>) {
         );
         return;
     };
+    if displayed_thumbnail_matches(request.image, request.path) {
+        return;
+    }
     let key = ThumbnailKey {
         path: path.clone(),
         modified: request.modified,
         file_size: request.file_size,
         thumbnail_size,
     };
-    // Disk validation moves to fire time so offscreen rows never touch the disk.
     match THUMBNAIL_CACHE.with(|cache| cache.borrow_mut().get(&key)) {
         Some(CacheHit::Ready(texture)) => {
-            cancel_thumbnail(request.image.as_ptr() as usize);
-            if displayed_thumbnail_matches(request.image, request.path) {
-                return;
-            }
-            apply_thumbnail(request.image, &texture, &path);
+            let (image_id, request_id) = set_fallback_icon(
+                request.image,
+                Some(request.path),
+                request.fallback_icon,
+                request.icon_size,
+            );
+            ensure_image_slot(request.image, thumbnail_size);
+            let target = register_active_request(request.image, image_id, request_id);
+            queue_thumbnail_apply(target, texture, path);
             return;
         }
         Some(CacheHit::Failed) => {
@@ -431,37 +439,17 @@ fn set_thumbnail_for_path(request: ThumbnailRequest<'_>) {
         }
         None => {}
     }
-    let (image_id, request_id) = if displayed_thumbnail_matches(request.image, request.path) {
-        prepare_thumbnail_target(request.image, thumbnail_size)
-    } else {
-        set_fallback_icon(
-            request.image,
-            Some(request.path),
-            request.fallback_icon,
-            request.icon_size,
-        )
-    };
+    let (image_id, request_id) = set_fallback_icon(
+        request.image,
+        Some(request.path),
+        request.fallback_icon,
+        request.icon_size,
+    );
     ensure_image_slot(request.image, thumbnail_size);
-    let weak_image = glib::WeakRef::new();
-    weak_image.set(Some(request.image));
-    ACTIVE_REQUESTS.with(|requests| {
-        requests.borrow_mut().insert(
-            image_id,
-            ActiveRequest {
-                id: request_id,
-                image: weak_image.clone(),
-                deferred: None,
-            },
-        );
-    });
-    let target = PendingTarget {
-        image_id,
-        request: request_id,
-        image: weak_image,
-    };
+    let target = register_active_request(request.image, image_id, request_id);
     // Binds run while GTK mutates the widget tree; walking ancestors or hooking the viewport here can corrupt layout. Defer to idle.
     glib::idle_add_local_once(move || {
-        if target_live_image(&target).is_some() {
+        if request_is_live(&target) {
             park_thumbnail(key, kind, target, request.wait_for_metadata);
         }
     });
@@ -478,6 +466,7 @@ fn viewport_of(image: &gtk::Image) -> Option<gtk::ScrolledWindow> {
     None
 }
 
+#[cfg(test)]
 fn rect_eligible(
     x: f32,
     y: f32,
@@ -495,71 +484,6 @@ fn rect_eligible(
         && x + width > -viewport_width * overscan
         && y < viewport_height * (1.0 + overscan)
         && y + height > -viewport_height * overscan
-}
-
-fn image_viewport_rect(
-    image: &gtk::Image,
-    viewport: &gtk::ScrolledWindow,
-) -> Option<(f32, f32, f32, f32)> {
-    let bounds = image.compute_bounds(viewport)?;
-    Some((bounds.x(), bounds.y(), bounds.width(), bounds.height()))
-}
-
-fn list_item_owner(widget: &gtk::Widget) -> Option<gtk::Widget> {
-    let mut child = widget.clone();
-    while let Some(parent) = child.parent() {
-        if parent.is::<gtk::ListView>() || parent.is::<gtk::GridView>() {
-            return Some(child);
-        }
-        child = parent;
-    }
-    None
-}
-
-/// GTK keeps stale allocations from fling-visited rows; hit-test the visible part to find the row actually displayed.
-fn image_is_currently_picked(
-    image: &gtk::Image,
-    viewport: &gtk::ScrolledWindow,
-    x: f32,
-    y: f32,
-    width: f32,
-    height: f32,
-) -> bool {
-    let left = x.max(0.0);
-    let right = (x + width).min(viewport.width() as f32);
-    let top = y.max(0.0);
-    let bottom = (y + height).min(viewport.height() as f32);
-    if left >= right || top >= bottom {
-        return true;
-    }
-    let Some(picked) = viewport.pick(
-        f64::from((left + right) / 2.0),
-        f64::from((top + bottom) / 2.0),
-        gtk::PickFlags::DEFAULT,
-    ) else {
-        return false;
-    };
-    match (
-        list_item_owner(image.upcast_ref()),
-        list_item_owner(&picked),
-    ) {
-        (Some(image), Some(picked)) => image == picked,
-        _ => false,
-    }
-}
-
-fn image_eligible(image: &gtk::Image, viewport: &gtk::ScrolledWindow) -> bool {
-    let Some((x, y, width, height)) = image_viewport_rect(image, viewport) else {
-        return false;
-    };
-    rect_eligible(
-        x,
-        y,
-        width,
-        height,
-        viewport.width() as f32,
-        viewport.height() as f32,
-    ) && image_is_currently_picked(image, viewport, x, y, width, height)
 }
 
 fn group_address(viewport: Option<&gtk::ScrolledWindow>) -> usize {
@@ -614,7 +538,7 @@ fn park_thumbnail(
     if let Some(viewport) = viewport {
         hook_viewport(group, &viewport);
     }
-    request_group_fire(group);
+    fire_view_group(group);
 }
 
 #[cfg(test)]
@@ -703,67 +627,75 @@ fn fire_settled_thumbnails() {
     fire_view_group(0);
 }
 
-fn target_live_image(target: &PendingTarget) -> Option<gtk::Image> {
-    let live = ACTIVE_REQUESTS.with(|requests| {
+fn request_is_live(target: &PendingTarget) -> bool {
+    ACTIVE_REQUESTS.with(|requests| {
         requests
             .borrow()
             .get(&target.image_id)
             .is_some_and(|active| active.id == target.request)
-    });
-    if !live {
+    })
+}
+
+fn target_live_image(target: &PendingTarget) -> Option<gtk::Image> {
+    if !request_is_live(target) {
         return None;
     }
     target.image.upgrade()
 }
 
-fn fire_parks(mut drained: Vec<SettledPark>, viewport: Option<&gtk::ScrolledWindow>) {
-    if let Some(viewport) = viewport {
-        // Bind order is not display order; queue top-to-bottom so the first visible item is not overtaken.
-        drained.sort_by(|left, right| {
-            let position = |park: &SettledPark| {
-                park.target
-                    .image
-                    .upgrade()
-                    .and_then(|image| image_viewport_rect(&image, viewport))
-                    .map_or((f32::MAX, f32::MAX), |(x, y, _, _)| (y, x))
-            };
-            let left = position(left);
-            let right = position(right);
-            left.0
-                .total_cmp(&right.0)
-                .then_with(|| left.1.total_cmp(&right.1))
-        });
+fn register_active_request(image: &gtk::Image, image_id: usize, request_id: u64) -> PendingTarget {
+    let weak_image = glib::WeakRef::new();
+    weak_image.set(Some(image));
+    ACTIVE_REQUESTS.with(|requests| {
+        requests.borrow_mut().insert(
+            image_id,
+            ActiveRequest {
+                id: request_id,
+                image: weak_image.clone(),
+                deferred: None,
+            },
+        );
+    });
+    PendingTarget {
+        image_id,
+        request: request_id,
+        image: weak_image,
     }
-    let mut offscreen = Vec::new();
+}
+
+fn queue_thumbnail_apply(target: PendingTarget, texture: gdk::Texture, path: PathBuf) {
+    glib::idle_add_local_once(move || {
+        if !request_is_live(&target) {
+            crate::metrics::mark_thumbnail_stale();
+            return;
+        }
+        let Some(image) = target.image.upgrade() else {
+            crate::metrics::mark_thumbnail_stale();
+            ACTIVE_REQUESTS.with(|requests| {
+                requests.borrow_mut().remove(&target.image_id);
+            });
+            return;
+        };
+        ACTIVE_REQUESTS.with(|requests| {
+            requests.borrow_mut().remove(&target.image_id);
+        });
+        apply_thumbnail(&image, &texture, &path);
+        crate::metrics::mark_thumbnail_applied();
+    });
+}
+
+fn fire_parks(drained: Vec<SettledPark>, viewport: Option<&gtk::ScrolledWindow>) {
     let mut eligible = 0;
     let mut started = false;
     for park in drained {
-        let image_id = park.target.image_id;
-        let request = park.target.request;
-        let live = ACTIVE_REQUESTS.with(|requests| {
-            requests
-                .borrow()
-                .get(&image_id)
-                .is_some_and(|active| active.id == request)
-        });
-        if !live {
-            continue;
-        }
-        let image = park.target.image.upgrade();
-        if let (Some(image), Some(viewport)) = (image.as_ref(), viewport)
-            && !image_eligible(image, viewport)
-        {
-            // Keep pre-bound offscreen requests parked; scrolling into them starts work without a rebind.
-            offscreen.push(park);
+        if !request_is_live(&park.target) {
             continue;
         }
         eligible += 1;
-        if let Some(image) = image.as_ref()
-            && let Some(hit) = THUMBNAIL_CACHE.with(|cache| cache.borrow_mut().get(&park.key))
-        {
+        if let Some(hit) = THUMBNAIL_CACHE.with(|cache| cache.borrow_mut().get(&park.key)) {
             match hit {
                 CacheHit::Ready(texture) => {
-                    apply_thumbnail(image, &texture, &park.key.path);
+                    queue_thumbnail_apply(park.target, texture, park.key.path);
                 }
                 CacheHit::Failed => {}
             }
@@ -773,6 +705,8 @@ fn fire_parks(mut drained: Vec<SettledPark>, viewport: Option<&gtk::ScrolledWind
             push_metadata_waiter(group_of_viewport(viewport), park);
             continue;
         }
+        let image_id = park.target.image_id;
+        let request = park.target.request;
         if schedule_thumbnail(park.key.clone(), park.kind, park.target) {
             started = true;
         } else {
@@ -783,16 +717,6 @@ fn fire_parks(mut drained: Vec<SettledPark>, viewport: Option<&gtk::ScrolledWind
         start_thumbnail_jobs();
     }
     crate::metrics::mark_thumbnail_eligible(eligible);
-    if let Some(viewport) = viewport
-        && !offscreen.is_empty()
-    {
-        let group = group_address(Some(viewport));
-        SETTLE_VIEWS.with(|views| {
-            if let Some(settle) = views.borrow_mut().get_mut(&group) {
-                settle.pending.extend(offscreen);
-            }
-        });
-    }
 }
 
 fn group_of_viewport(viewport: Option<&gtk::ScrolledWindow>) -> usize {
@@ -896,7 +820,7 @@ fn park_into_group(
             settle.first_park = Some(Instant::now());
         }
     });
-    request_group_fire(group);
+    fire_view_group(group);
 }
 
 fn schedule_thumbnail(key: ThumbnailKey, kind: ThumbnailKind, target: PendingTarget) -> bool {
@@ -1068,31 +992,17 @@ fn finish_thumbnail_targets(
     path: &Path,
 ) {
     for target in targets {
-        let is_current = ACTIVE_REQUESTS.with(|requests| {
-            let mut requests = requests.borrow_mut();
-            if requests
-                .get(&target.image_id)
-                .is_some_and(|active| active.id == target.request)
-            {
-                requests.remove(&target.image_id);
-                true
-            } else {
-                false
-            }
-        });
-        if !is_current {
+        if !request_is_live(&target) {
             crate::metrics::mark_thumbnail_stale();
             continue;
         }
         let Some(texture) = texture else {
+            ACTIVE_REQUESTS.with(|requests| {
+                requests.borrow_mut().remove(&target.image_id);
+            });
             continue;
         };
-        let Some(image) = target.image.upgrade() else {
-            crate::metrics::mark_thumbnail_stale();
-            continue;
-        };
-        apply_thumbnail(&image, texture, path);
-        crate::metrics::mark_thumbnail_applied();
+        queue_thumbnail_apply(target, texture.clone(), path.to_path_buf());
     }
 }
 
@@ -1379,6 +1289,38 @@ fn render_thumbnail(
         cancellation,
     )
     .map(|output| output.data)
+}
+
+#[cfg(test)]
+pub(super) fn pending_thumbnail_id(path: &Path) -> Option<u64> {
+    PENDING_THUMBNAILS.with(|pending| {
+        pending
+            .borrow()
+            .iter()
+            .find_map(|(key, pending)| (key.path == path).then_some(pending.id))
+    })
+}
+
+#[cfg(test)]
+pub(super) fn has_pending_thumbnail(path: &Path) -> bool {
+    pending_thumbnail_id(path).is_some()
+}
+
+#[cfg(test)]
+pub(super) fn hold_thumbnail_workers() {
+    THUMBNAIL_QUEUE.with(|queue| queue.borrow_mut().running = MAX_THUMBNAIL_WORKERS);
+}
+
+#[cfg(test)]
+pub(super) fn clear_thumbnail_runtime() {
+    THUMBNAIL_QUEUE.with(|queue| {
+        let mut queue = queue.borrow_mut();
+        queue.running = 0;
+        queue.queued.clear();
+    });
+    PENDING_THUMBNAILS.with(|pending| pending.borrow_mut().clear());
+    ACTIVE_REQUESTS.with(|requests| requests.borrow_mut().clear());
+    SETTLE_VIEWS.with(|views| views.borrow_mut().clear());
 }
 
 #[cfg(test)]

@@ -1811,6 +1811,7 @@ struct IconsContext {
     source_index: SourceIndexMap,
     sections: Weak<RefCell<Vec<PaneSection>>>,
     density: Cell<BrowserDensity>,
+    scrolling: Rc<Cell<bool>>,
 }
 
 type IconsGroupBuilder = Rc<dyn Fn(&str) -> IconsGroup>;
@@ -1888,6 +1889,7 @@ fn build_icons_pane(
         source_index: source_index.clone(),
         sections: Rc::downgrade(&sections),
         density: Cell::new(options.density),
+        scrolling: Rc::new(Cell::new(false)),
     });
     let (root, pane_section, groups) = if options.group_by_type {
         let container = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -1980,6 +1982,34 @@ fn build_icons_pane(
         .build();
     scroll.add_css_class("fixed-scrollbar");
     close_thumbnail_popover_on_outside_scroll(&controls.thumbnail_popover, &scroll);
+    let browser_for_settle = Rc::downgrade(&context.browser);
+    let source_index_for_settle = context.source_index.clone();
+    let sections_for_settle = context.sections.clone();
+    let cuts_for_settle = context.cuts.clone();
+    let depth_for_settle = context.depth;
+    install_scroll_settle(
+        &scroll,
+        context.scrolling.clone(),
+        "icons-fast-scroll",
+        move || {
+            let Some(browser) = browser_for_settle.upgrade() else {
+                return;
+            };
+            let Some(sections) = sections_for_settle.upgrade() else {
+                return;
+            };
+            let cuts = cuts_for_settle.borrow();
+            for section in sections.borrow().iter() {
+                refresh_icons_section(
+                    &browser,
+                    depth_for_settle,
+                    &source_index_for_settle,
+                    section,
+                    &cuts,
+                );
+            }
+        },
+    );
     if let Some(groups) = groups.clone() {
         let context = Rc::downgrade(&context);
         scroll
@@ -2178,6 +2208,7 @@ fn build_icons_view(
     let cuts_for_bind = context.cuts.clone();
     let thumbnail_size_for_bind = context.thumbnail_size.clone();
     let entry_kind_for_bind = context.new_entry_is_directory.clone();
+    let scrolling_for_bind = context.scrolling.clone();
     factory.connect_bind(move |_, item| {
         let Some(item) = item.downcast_ref::<gtk::ListItem>() else {
             return;
@@ -2198,27 +2229,20 @@ fn build_icons_view(
         let thumbnail_size = icons_card_icon_slot(thumbnail_size_for_bind.get());
         super::icons_cell::set_slot(&card, thumbnail_size);
         if let Some(entry) = entry {
-            label.set_visible(true);
-            field.set_visible(false);
-            if label.text().as_deref() != Some(entry.display_name.as_str()) {
-                label.set_text(Some(&entry.display_name));
-            }
-            label.set_tooltip_text(Some(&entry.display_name));
-            super::accessibility::describe_entry(item, &entry.display_name, Some(&entry));
-            set_mode_cut_style(&card, cuts_for_bind.borrow().contains(&entry.location));
-            super::thumbnail::set_thumbnail_or_icon(
-                &icon,
+            apply_icons_entry(
+                Some(item),
+                &card,
                 &entry,
-                super::browser::entry_icon(&entry),
+                &cuts_for_bind.borrow(),
                 thumbnail_size,
-                thumbnail_size,
+                scrolling_for_bind.get(),
             );
-            if let Some(position) = metadata_fill_position(source_position, &entry, false)
+            if !scrolling_for_bind.get()
+                && let Some(position) = metadata_fill_position(source_position, &entry, false)
                 && let Some(browser) = browser.as_ref()
             {
                 browser.request_metadata_fill(depth, position, entry.location.clone());
             }
-            icon.set_opacity(if entry.is_directory() { 1.0 } else { 0.72 });
         } else {
             set_mode_cut_style(&card, false);
             let icon_name = if entry_kind_for_bind.get() {
@@ -4034,6 +4058,80 @@ fn set_label_if_changed(label: &gtk::Label, text: &str) {
     if label.label() != text {
         label.set_label(text);
     }
+}
+
+fn apply_icons_entry(
+    item: Option<&gtk::ListItem>,
+    card: &gtk::Box,
+    entry: &FileEntry,
+    cuts: &HashSet<Location>,
+    thumbnail_size: i32,
+    scrolling: bool,
+) {
+    let Some((icon, label, field)) = super::icons_cell::parts(card) else {
+        return;
+    };
+    label.set_visible(true);
+    field.set_visible(false);
+    if label.text().as_deref() != Some(entry.display_name.as_str()) {
+        label.set_text(Some(&entry.display_name));
+    }
+    super::thumbnail::set_thumbnail_or_icon(
+        &icon,
+        entry,
+        super::browser::entry_icon(entry),
+        thumbnail_size,
+        thumbnail_size,
+    );
+    if !scrolling {
+        refresh_icons_card_chrome(item, card, &icon, &label, entry, cuts);
+    }
+}
+
+fn refresh_icons_card_chrome(
+    item: Option<&gtk::ListItem>,
+    card: &gtk::Box,
+    icon: &gtk::Image,
+    label: &gtk::Inscription,
+    entry: &FileEntry,
+    cuts: &HashSet<Location>,
+) {
+    label.set_tooltip_text(Some(&entry.display_name));
+    if let Some(item) = item {
+        super::accessibility::describe_entry(item, &entry.display_name, Some(entry));
+    }
+    set_mode_cut_style(card, cuts.contains(&entry.location));
+    icon.set_opacity(if entry.is_directory() { 1.0 } else { 0.72 });
+}
+
+fn refresh_icons_section(
+    browser: &Rc<Browser>,
+    depth: usize,
+    source_index: &SourceIndexMap,
+    section: &PaneSection,
+    cuts: &HashSet<Location>,
+) {
+    section.bound_items.borrow().iter().for_each(|bound| {
+        let Some(card) = bound.widget.upgrade().and_downcast::<gtk::Box>() else {
+            return;
+        };
+        let Some((icon, label, _)) = super::icons_cell::parts(&card) else {
+            return;
+        };
+        let Some(item) = bound.item.upgrade() else {
+            return;
+        };
+        let Some(position) = item.item().and_then(|value| source_index.of_item(&value)) else {
+            return;
+        };
+        let Some(entry) = browser.entry_at(depth, position) else {
+            return;
+        };
+        refresh_icons_card_chrome(Some(&item), &card, &icon, &label, &entry, cuts);
+        if let Some(position) = metadata_fill_position(Some(position), &entry, false) {
+            browser.request_metadata_fill(depth, position, entry.location.clone());
+        }
+    });
 }
 
 fn refresh_list_section(

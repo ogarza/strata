@@ -7,7 +7,10 @@ use super::{
     scroll_delta_for_unit, should_activate_pointer_click, type_groups_of, value_type_group,
 };
 use crate::model::{EntryKind, FileEntry, Location, MetadataValue};
+use crate::test_support::gtk_test;
 use gtk::{gio, prelude::*};
+use std::collections::HashSet;
+use std::path::PathBuf;
 use std::process::Command;
 
 /// Model values as the panes store them: kind, hidden flag, then the display name.
@@ -308,4 +311,47 @@ fn source_index_map_tracks_filter_sort_and_placeholder() {
         .status()
         .expect("isolated GTK mapping test should start");
     assert!(status.success(), "isolated GTK mapping test failed");
+}
+
+#[test]
+fn icons_scrolling_bind_still_requests_thumbnail_and_settle_fills_chrome() {
+    gtk_test(
+        "ui::browser_modes::tests::icons_scrolling_bind_still_requests_thumbnail_and_settle_fills_chrome",
+        || {
+            crate::ui::theme::ThemeManager::shared();
+            crate::ui::thumbnail::hold_thumbnail_workers();
+            let path = PathBuf::from("/fixture/icons-scroll.png");
+            let entry = FileEntry {
+                location: Location::local(&path),
+                thumbnail_path: None,
+                native_name: "icons-scroll.png".into(),
+                display_name: "icons-scroll.png".into(),
+                kind: EntryKind::File,
+                size: MetadataValue::Known(1),
+                modified_unix_seconds: MetadataValue::Known(1),
+                mode: MetadataValue::Known(0o100644),
+                is_hidden: false,
+            };
+            let card = crate::ui::icons_cell::new_card(64);
+            super::apply_icons_entry(None, &card, &entry, &HashSet::new(), 64, true);
+            let (icon, label, _) = crate::ui::icons_cell::parts(&card).expect("icons card");
+            assert!(label.tooltip_text().is_none());
+            assert!(!card.has_css_class("cut"));
+            let context = gtk::glib::MainContext::default();
+            for _ in 0..64 {
+                if !context.iteration(false) {
+                    break;
+                }
+            }
+            assert!(crate::ui::thumbnail::has_pending_thumbnail(&path));
+            let job = crate::ui::thumbnail::pending_thumbnail_id(&path);
+            let mut cuts = HashSet::new();
+            cuts.insert(entry.location.clone());
+            super::refresh_icons_card_chrome(None, &card, &icon, &label, &entry, &cuts);
+            assert_eq!(label.tooltip_text().as_deref(), Some("icons-scroll.png"));
+            assert!(card.has_css_class("cut"));
+            assert_eq!(crate::ui::thumbnail::pending_thumbnail_id(&path), job);
+            crate::ui::thumbnail::clear_thumbnail_runtime();
+        },
+    );
 }
