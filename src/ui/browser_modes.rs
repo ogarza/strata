@@ -1333,6 +1333,15 @@ impl ModeViews {
             return;
         }
         if self.suppress_focus_scroll.replace(false) {
+            if let Some(position) = position
+                && let Some(items) = pane
+                    .item_sections()
+                    .into_iter()
+                    .find(|section| section.view == view)
+                    .map(|section| section.bound_items.clone())
+            {
+                focus_collection_cursor_when_bound(view.downgrade(), items, position);
+            }
             return;
         }
         let view = view.downgrade();
@@ -3876,6 +3885,64 @@ fn scroll_pane_to_source(pane: &Pane, source_position: usize) {
 
 fn scroll_collection_to(view: &gtk::Widget, position: u32) {
     super::browser::scroll_collection_when_allocated(view, position);
+}
+
+fn focus_collection_cursor_when_bound(
+    view: glib::object::WeakRef<gtk::Widget>,
+    items: Rc<RefCell<Vec<BoundModeItem>>>,
+    position: u32,
+) {
+    glib::idle_add_local_once(move || {
+        let Some(view) = view.upgrade() else {
+            return;
+        };
+        if !collection_keeps_cursor(&view) {
+            return;
+        }
+        if focus_bound_cursor(&items, position) {
+            return;
+        }
+        let frames = Cell::new(0u8);
+        let items = items.clone();
+        view.add_tick_callback(move |view, _| {
+            if !collection_keeps_cursor(view)
+                || focus_bound_cursor(&items, position)
+                || frames.get() >= 8
+            {
+                return glib::ControlFlow::Break;
+            }
+            frames.set(frames.get().saturating_add(1));
+            glib::ControlFlow::Continue
+        });
+    });
+}
+
+fn collection_keeps_cursor(view: &gtk::Widget) -> bool {
+    let focused = view.root().and_then(|root| root.focus());
+    if focused.as_ref().is_some_and(|focused| {
+        super::focus_navigation::editable(focused) || super::focus_navigation::in_popover(focused)
+    }) {
+        return false;
+    }
+    focused.as_ref().is_none_or(|focused| {
+        focused == view || view.is_ancestor(focused) || focused.is_ancestor(view)
+    })
+}
+
+fn focus_bound_cursor(items: &RefCell<Vec<BoundModeItem>>, position: u32) -> bool {
+    let Some(widget) = items.borrow().iter().find_map(|bound| {
+        let item = bound.item.upgrade()?;
+        (item.position() == position)
+            .then(|| bound.widget.upgrade())
+            .flatten()
+            .filter(|widget| widget.is_mapped())
+    }) else {
+        return false;
+    };
+    widget
+        .parent()
+        .map(|parent| parent.grab_focus())
+        .unwrap_or_else(|| widget.grab_focus())
 }
 
 fn set_mode_cut_style(widget: &impl IsA<gtk::Widget>, cut: bool) {
