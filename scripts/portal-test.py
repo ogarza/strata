@@ -18,6 +18,8 @@ import time
 import uuid
 import zlib
 
+from portal_test_environment import isolated_process_environment
+
 from gi.repository import Gio, GLib
 
 BACKEND = "org.freedesktop.impl.portal.desktop.strata"
@@ -106,11 +108,11 @@ def main():
     parser.add_argument("--folder", type=Path, help="Initial folder; defaults to a disposable sample fixture")
     parser.add_argument("--choices", action="store_true")
     parser.add_argument("--cancel-after", type=float, metavar="SECONDS")
-    parser.add_argument("--view", choices=["columns", "grid", "explorer"], default="explorer")
+    parser.add_argument("--view", choices=["columns", "icons", "list"], default="list")
     parser.add_argument("--theme", default="tokyo-night", help="Built-in theme for the isolated backend")
     parser.add_argument("--group-by-type", action="store_true")
     args = parser.parse_args()
-    if not args.binary and (args.theme != "tokyo-night" or args.view != "explorer" or args.group_by_type):
+    if not args.binary and (args.theme != "tokyo-night" or args.view != "list" or args.group_by_type):
         parser.error("Theme and view overrides require --binary; existing user settings are never modified")
     with tempfile.TemporaryDirectory(prefix="strata-portal-test-") as temporary:
         root = Path(temporary)
@@ -120,9 +122,7 @@ def main():
         bus = backend = None
         try:
             if args.binary:
-                env = os.environ.copy()
-                for key, directory in [("XDG_CONFIG_HOME", "config"), ("XDG_DATA_HOME", "data"), ("XDG_CACHE_HOME", "cache")]:
-                    env[key] = str(root / directory)
+                env = isolated_process_environment(root)
                 settings = root / "config/strata/settings.toml"
                 settings.parent.mkdir(parents=True)
                 settings.write_text(
@@ -135,11 +135,14 @@ def main():
                         for key, name in (("DOCUMENTS", "Documents"), ("DOWNLOAD", "Downloads"),
                                           ("PICTURES", "Pictures"), ("VIDEOS", "Videos"))
                     ), encoding="utf-8")
-                bus = subprocess.Popen(["dbus-daemon", "--session", "--nofork", "--print-address=1"],
-                                       stdout=subprocess.PIPE, text=True)
+                bus = subprocess.Popen(
+                    ["dbus-daemon", "--session", "--nofork", "--print-address=1"],
+                    stdout=subprocess.PIPE,
+                    text=True,
+                    env=env,
+                )
                 address = bus.stdout.readline().strip()
                 env["DBUS_SESSION_BUS_ADDRESS"] = address
-                env["GIO_USE_VFS"] = "local"
                 backend = subprocess.Popen([str(args.binary.resolve()), "--portal"], env=env)
             else:
                 address = os.environ["DBUS_SESSION_BUS_ADDRESS"]

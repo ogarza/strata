@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use super::{
-    BrowserMode, ClickActivation, ClickCount, EXPLORER_COLUMN_MIN_WIDTHS, EXPLORER_COLUMN_WIDTHS,
-    MAX_GRID_THUMBNAIL_SIZE, MIN_GRID_THUMBNAIL_SIZE, SourceIndexMap, compare_type_groups,
-    explorer_column_width, first_model_type_group, grid_card_extent, grid_card_icon_slot,
-    metadata_fill_position, scroll_delta_for_unit, should_activate_pointer_click,
-    type_group_for_first_intersecting, type_group_sorter, type_groups_of, value_type_group,
+    BrowserMode, ClickActivation, ClickCount, LIST_COLUMN_MIN_WIDTHS, LIST_COLUMN_WIDTHS,
+    MAX_ICONS_THUMBNAIL_SIZE, MIN_ICONS_THUMBNAIL_SIZE, SourceIndexMap, compare_type_groups,
+    icons_card_extent, icons_card_icon_slot, list_column_width, metadata_fill_position,
+    scroll_delta_for_unit, should_activate_pointer_click, type_groups_of, value_type_group,
 };
 use crate::model::{EntryKind, FileEntry, Location, MetadataValue};
 use gtk::{gio, prelude::*};
@@ -17,19 +16,16 @@ fn value(kind: char, name: &str) -> String {
 }
 
 #[test]
-fn explorer_columns_have_usable_minimum_widths() {
-    for (index, minimum) in EXPLORER_COLUMN_MIN_WIDTHS.into_iter().enumerate() {
-        assert_eq!(explorer_column_width(index, minimum - 1), minimum);
-        assert_eq!(explorer_column_width(index, minimum + 1), minimum + 1);
+fn list_columns_have_usable_minimum_widths() {
+    for (index, minimum) in LIST_COLUMN_MIN_WIDTHS.into_iter().enumerate() {
+        assert_eq!(list_column_width(index, minimum - 1), minimum);
+        assert_eq!(list_column_width(index, minimum + 1), minimum + 1);
     }
 }
 
 #[test]
-fn explorer_default_widths_respect_column_minimums() {
-    for (default, minimum) in EXPLORER_COLUMN_WIDTHS
-        .into_iter()
-        .zip(EXPLORER_COLUMN_MIN_WIDTHS)
-    {
+fn list_default_widths_respect_column_minimums() {
+    for (default, minimum) in LIST_COLUMN_WIDTHS.into_iter().zip(LIST_COLUMN_MIN_WIDTHS) {
         assert!(default >= minimum);
     }
 }
@@ -43,13 +39,6 @@ fn stored_click_counts_reject_unsupported_values() {
 }
 
 #[test]
-fn type_grouping_is_explorer_only() {
-    assert!(!BrowserMode::Columns.supports_type_grouping());
-    assert!(!BrowserMode::Grid.supports_type_grouping());
-    assert!(BrowserMode::Explorer.supports_type_grouping());
-}
-
-#[test]
 fn click_activation_defaults_follow_view_conventions() {
     assert_eq!(
         ClickActivation::default_for(BrowserMode::Columns),
@@ -58,7 +47,7 @@ fn click_activation_defaults_follow_view_conventions() {
             folders: ClickCount::One,
         }
     );
-    for mode in [BrowserMode::Grid, BrowserMode::Explorer] {
+    for mode in [BrowserMode::Icons, BrowserMode::List] {
         assert_eq!(
             ClickActivation::default_for(mode),
             ClickActivation {
@@ -67,6 +56,13 @@ fn click_activation_defaults_follow_view_conventions() {
             }
         );
     }
+}
+
+#[test]
+fn type_grouping_is_list_only() {
+    assert!(!BrowserMode::Columns.supports_type_grouping());
+    assert!(!BrowserMode::Icons.supports_type_grouping());
+    assert!(BrowserMode::List.supports_type_grouping());
 }
 
 #[test]
@@ -86,6 +82,7 @@ fn alternate_modes_request_missing_metadata_for_bound_entries() {
     let mut entry = FileEntry {
         location: Location::local("/fixture/photo.jpg"),
         native_name: "photo.jpg".into(),
+        thumbnail_path: None,
         display_name: "photo.jpg".into(),
         kind: EntryKind::File,
         size: MetadataValue::Unknown,
@@ -107,19 +104,19 @@ fn alternate_modes_request_missing_metadata_for_bound_entries() {
 }
 
 #[test]
-fn grid_cards_keep_a_uniform_icon_slot_and_two_line_label() {
-    assert_eq!(grid_card_icon_slot(26), MIN_GRID_THUMBNAIL_SIZE);
-    assert_eq!(grid_card_icon_slot(128), 128);
-    assert_eq!(grid_card_icon_slot(512), MAX_GRID_THUMBNAIL_SIZE);
-    assert_eq!(grid_card_extent(26), grid_card_extent(64));
-    assert_eq!(grid_card_extent(64), (156, 107));
-    assert_eq!(grid_card_extent(128), (156, 171));
-    assert_eq!(grid_card_extent(256), (256, 299));
-    assert_eq!(grid_card_extent(512), grid_card_extent(256));
+fn icons_cards_keep_a_uniform_icon_slot_and_two_line_label() {
+    assert_eq!(icons_card_icon_slot(26), MIN_ICONS_THUMBNAIL_SIZE);
+    assert_eq!(icons_card_icon_slot(128), 128);
+    assert_eq!(icons_card_icon_slot(512), MAX_ICONS_THUMBNAIL_SIZE);
+    assert_eq!(icons_card_extent(26), icons_card_extent(64));
+    assert_eq!(icons_card_extent(64), (156, 107));
+    assert_eq!(icons_card_extent(128), (156, 171));
+    assert_eq!(icons_card_extent(256), (256, 299));
+    assert_eq!(icons_card_extent(512), icons_card_extent(256));
 }
 
 #[test]
-fn grid_scroll_maps_a_wheel_notch_from_page_size() {
+fn icons_scroll_maps_a_wheel_notch_from_page_size() {
     let wheel = scroll_delta_for_unit(1.0, 1000.0, gtk::gdk::ScrollUnit::Wheel);
     assert!((wheel - 100.0).abs() < 1e-9);
     assert!(scroll_delta_for_unit(1.0, 8000.0, gtk::gdk::ScrollUnit::Wheel) > wheel);
@@ -176,121 +173,11 @@ fn entries_of_one_type_share_a_group() {
     );
 }
 
-#[test]
-fn type_group_sort_clusters_mixed_entries_and_keeps_placeholder_first() {
-    let mut values = [
-        value('f', "notes.json"),
-        String::new(),
-        value('d', "projects"),
-        value('f', "data.json"),
-        value('d', "archive"),
-        value('f', "README.md"),
-    ];
-    values.sort_by(|left, right| {
-        compare_type_groups(&value_type_group(left), &value_type_group(right))
-    });
-
-    assert_eq!(values[0], "");
-    assert_eq!(value_type_group(&values[1]), "Folder");
-    assert_eq!(value_type_group(&values[2]), "Folder");
-    let json = value_type_group(&value('f', "notes.json"));
-    let markdown = value_type_group(&value('f', "README.md"));
-    assert_eq!(value_type_group(&values[3]), json);
-    assert_eq!(value_type_group(&values[4]), json);
-    assert_eq!(value_type_group(&values[5]), markdown);
-    assert!(compare_type_groups(&json, &markdown).is_lt());
-}
-
-#[test]
-fn the_sticky_heading_uses_the_first_card_intersecting_the_viewport() {
-    let json = value('f', "notes.json");
-    let folder = value('d', "projects");
-    let markdown = value('f', "README.md");
-    let json_group = value_type_group(&json);
-    assert_eq!(
-        type_group_for_first_intersecting(
-            [
-                (0, String::new(), 0.0, 40.0),
-                (1, folder, -80.0, 40.0),
-                (12, markdown, 35.0, 40.0),
-                (8, json.clone(), -10.0, 40.0),
-            ]
-            .into_iter(),
-            100.0,
-        )
-        .as_deref(),
-        Some(json_group.as_str())
-    );
-    assert_eq!(
-        type_group_for_first_intersecting(
-            [(0, String::new(), 0.0, 40.0), (1, json, 100.0, 40.0)].into_iter(),
-            100.0,
-        ),
-        None
-    );
-}
-
-const TYPE_GROUP_SORT_GTK_CHILD: &str = "STRATA_TYPE_GROUP_SORT_GTK_CHILD";
-const TYPE_GROUP_SORT_TEST: &str =
-    "ui::browser_modes::tests::type_group_sorter_clusters_a_flattened_grid_model";
-
-fn run_type_group_sorter_checks() {
-    let source = gtk::StringList::new(&[
-        &value('f', "notes.json"),
-        &value('d', "projects"),
-        &value('f', "data.json"),
-        &value('d', "archive"),
-        &value('d', "alpha"),
-        &value('d', "beta"),
-        &value('d', "gamma"),
-        &value('f', "README.md"),
-    ]);
-    let placeholder = gtk::StringList::new(&[""]);
-    let stacked = gio::ListStore::new::<gio::ListModel>();
-    stacked.append(&placeholder.clone().upcast::<gio::ListModel>());
-    stacked.append(&source.clone().upcast::<gio::ListModel>());
-    let flattened = gtk::FlattenListModel::new(Some(stacked));
-    let sorter = type_group_sorter();
-    let sorted = gtk::SortListModel::new(Some(flattened), Some(sorter.clone()));
-    sorted.set_section_sorter(Some(&sorter));
-
-    let groups: Vec<String> = (0..sorted.n_items())
-        .filter_map(|index| sorted.item(index).map(|item| super::model_value(&item)))
-        .map(|value| value_type_group(&value))
-        .collect();
-    assert_eq!(groups[0], "");
-    assert_eq!(&groups[1..6], ["Folder"; 5]);
-    let json = value_type_group(&value('f', "notes.json"));
-    let markdown = value_type_group(&value('f', "README.md"));
-    assert_eq!(&groups[6..8], [json.as_str(), json.as_str()]);
-    assert_eq!(groups[8], markdown);
-    assert_eq!(sorted.section(1), (1, 6));
-    assert_eq!(sorted.section(5), (1, 6));
-    assert_eq!(sorted.section(6), (6, 8));
-    assert_eq!(first_model_type_group(sorted.upcast_ref()), "Folder");
-}
-
-#[test]
-fn type_group_sorter_clusters_a_flattened_grid_model() {
-    if std::env::var_os(TYPE_GROUP_SORT_GTK_CHILD).is_some() {
-        if gtk::init().is_err() {
-            return;
-        }
-        run_type_group_sorter_checks();
-        return;
-    }
-
-    let status = Command::new(std::env::current_exe().expect("test executable should exist"))
-        .args(["--exact", TYPE_GROUP_SORT_TEST])
-        .env(TYPE_GROUP_SORT_GTK_CHILD, "1")
-        .status()
-        .expect("isolated GTK grouping test should start");
-    assert!(status.success(), "isolated GTK grouping test failed");
-}
-
 const GTK_CHILD: &str = "STRATA_SOURCE_INDEX_MAP_GTK_CHILD";
 const SOURCE_INDEX_TEST: &str =
     "ui::browser_modes::tests::source_index_map_tracks_filter_sort_and_placeholder";
+const LIST_ROW_GTK_CHILD: &str = "STRATA_LIST_ROW_GTK_CHILD";
+const LIST_ROW_TEST: &str = "ui::browser_modes::tests::list_bind_can_read_the_rename_field";
 
 fn run_source_index_map_checks() {
     let source = gtk::StringList::new(&["fv\talpha", "dh\t.secret", "fv\tneedle"]);
@@ -382,6 +269,28 @@ fn run_source_index_map_checks() {
 }
 
 mod skeletons;
+
+#[test]
+fn list_bind_can_read_the_rename_field() {
+    if std::env::var_os(LIST_ROW_GTK_CHILD).is_some() {
+        if gtk::init().is_err() {
+            return;
+        }
+        let row = super::assemble_list_row();
+        let (_, name, field, _, _, _, _) =
+            super::list_row_parts(&row).expect("bind and settle walk this row");
+        assert!(name.has_css_class("alternate-rename-label"));
+        assert!(field.has_css_class("inline-rename"));
+        return;
+    }
+
+    let status = Command::new(std::env::current_exe().expect("test executable should exist"))
+        .args(["--exact", LIST_ROW_TEST])
+        .env(LIST_ROW_GTK_CHILD, "1")
+        .status()
+        .expect("isolated GTK list row test should start");
+    assert!(status.success(), "isolated GTK list row test failed");
+}
 
 #[test]
 fn source_index_map_tracks_filter_sort_and_placeholder() {

@@ -37,11 +37,12 @@ use crate::{
 
 use super::{
     blur::BlurBin,
-    browser::{BrowserView, dismiss_modal_layer, entry_supports_quick_preview, modal_layer},
+    browser::{BrowserView, dismiss_modal_layer, modal_layer},
+    browser_modes::BrowserMode,
     controls::{
         ModalTone, form_check_button, form_entry, form_label, menu_option, message_dialog_layout,
     },
-    preview::PreviewDrawer,
+    preview::{PreviewDrawer, preview_target},
     theme::ThemeManager,
     window::{
         MIN_SIDEBAR_WIDTH, SIDEBAR_WIDTH, SidebarView, build_appearance_menu, build_sidebar,
@@ -179,10 +180,6 @@ fn filter_directory_change(
         }
         change => change,
     }
-}
-
-fn chooser_preview_target(entry: Option<FileEntry>) -> Option<FileEntry> {
-    entry.filter(entry_supports_quick_preview)
 }
 
 #[derive(Clone)]
@@ -625,6 +622,62 @@ fn eligible_open_entries(entries: Vec<FileEntry>, directory: bool) -> Vec<FileEn
         .collect()
 }
 
+const MIN_CHOOSER_WIDTH: i32 = 640;
+const MIN_CHOOSER_HEIGHT: i32 = 460;
+const MAX_CHOOSER_WIDTH: i32 = 1000;
+const MAX_CHOOSER_HEIGHT: i32 = 680;
+const FALLBACK_CHOOSER_WIDTH: i32 = 920;
+const FALLBACK_CHOOSER_HEIGHT: i32 = 580;
+
+fn chooser_default_dimensions_for_monitor(monitor_width: i32, monitor_height: i32) -> (i32, i32) {
+    if monitor_width <= 0 || monitor_height <= 0 {
+        return (FALLBACK_CHOOSER_WIDTH, FALLBACK_CHOOSER_HEIGHT);
+    }
+    let target_width = (monitor_width.saturating_mul(80) / 100)
+        .min(monitor_width.saturating_sub(120))
+        .clamp(MIN_CHOOSER_WIDTH.min(monitor_width), MAX_CHOOSER_WIDTH);
+    let target_height = (monitor_height.saturating_mul(78) / 100)
+        .min(monitor_height.saturating_sub(100))
+        .clamp(MIN_CHOOSER_HEIGHT.min(monitor_height), MAX_CHOOSER_HEIGHT);
+
+    (target_width, target_height)
+}
+
+fn detect_monitor_geometry(
+    display: Option<&gtk::gdk::Display>,
+    window: Option<&gtk::Window>,
+) -> Option<(i32, i32)> {
+    let window_display = window.map(gtk::prelude::WidgetExt::display);
+    let default_display = gtk::gdk::Display::default();
+    let display = display
+        .or(window_display.as_ref())
+        .or(default_display.as_ref())?;
+
+    if let Some(geom) = window
+        .and_then(|w| w.surface())
+        .and_then(|surface| display.monitor_at_surface(&surface))
+        .map(|monitor| monitor.geometry())
+        .filter(|geom| geom.width() > 0 && geom.height() > 0)
+    {
+        return Some((geom.width(), geom.height()));
+    }
+
+    let monitors = display.monitors();
+    for index in 0..monitors.n_items() {
+        if let Some(monitor) = monitors
+            .item(index)
+            .and_then(|item| item.downcast::<gtk::gdk::Monitor>().ok())
+        {
+            let geom = monitor.geometry();
+            if geom.width() > 0 && geom.height() > 0 {
+                return Some((geom.width(), geom.height()));
+            }
+        }
+    }
+
+    None
+}
+
 pub(crate) fn present_chooser(
     request: ChooserRequest,
     cancelled: Arc<AtomicBool>,
@@ -661,7 +714,7 @@ fn build_chooser(
     view.set_group_by_type(theme.group_by_type());
     view.set_auto_refresh_interval(theme.auto_refresh_interval());
     view.set_peek_enabled(false);
-    view.set_single_click_previews(false);
+    view.set_single_click_previews(theme.single_click_previews());
     view.set_operation_provider(Rc::new(LocalOperationProvider));
     let browser = view.browser();
     let preview_preferences = theme.clone();
@@ -672,10 +725,15 @@ fn build_chooser(
         false,
     );
 
+    let (initial_width, initial_height) = detect_monitor_geometry(None, None).map_or(
+        (FALLBACK_CHOOSER_WIDTH, FALLBACK_CHOOSER_HEIGHT),
+        |(w, h)| chooser_default_dimensions_for_monitor(w, h),
+    );
+
     let window = gtk::Window::builder()
         .title(&request.title)
-        .default_width(1050)
-        .default_height(720)
+        .default_width(initial_width)
+        .default_height(initial_height)
         .modal(request.modal)
         .build();
     let header = gtk::HeaderBar::new();
@@ -921,34 +979,15 @@ fn build_chooser(
     }
 
     let state_for_observer = state.clone();
-    let preview_for_selection = preview.clone();
+    let preview_for_browser = preview.clone();
     let weak_browser = Rc::downgrade(&browser);
-    browser.observe(move |event| match event {
-        BrowserEvent::OpenRequested { location } => state_for_observer.activate_file(location),
-        BrowserEvent::PreviewRequested { entry } => preview_for_selection.show(entry.clone()),
-        BrowserEvent::FocusChanged {
-            depth,
-            position: Some(position),
+    browser.observe(move |event| {
+        if let BrowserEvent::OpenRequested { location } = event {
+            state_for_observer.activate_file(location);
         }
-        | BrowserEvent::SelectionSetChanged {
-            depth,
-            focused: position,
-            ..
-        } if preview_for_selection.is_open() => {
-            if let Some(entry) = weak_browser
-                .upgrade()
-                .and_then(|browser| browser.entry_at(*depth, *position))
-                .and_then(|entry| chooser_preview_target(Some(entry)))
-            {
-                preview_for_selection.show(entry);
-            } else {
-                preview_for_selection.close();
-            }
+        if let Some(browser) = weak_browser.upgrade() {
+            preview_for_browser.handle_browser_event(&browser, event);
         }
-        BrowserEvent::FocusChanged { position: None, .. } if preview_for_selection.is_open() => {
-            preview_for_selection.close();
-        }
-        _ => {}
     });
 
     let weak = Rc::downgrade(&state);
@@ -985,6 +1024,22 @@ fn build_chooser(
 
     gtk::prelude::WidgetExt::realize(&window);
     apply_external_parent(&window, state.request.parent.as_ref());
+    if let Some(surface) = window.surface() {
+        let weak_window = window.downgrade();
+        surface.connect_enter_monitor(move |_, monitor| {
+            let Some(window) = weak_window.upgrade() else {
+                return;
+            };
+            let geometry = monitor.geometry();
+            let dimensions =
+                chooser_default_dimensions_for_monitor(geometry.width(), geometry.height());
+            window.set_default_size(dimensions.0, dimensions.1);
+        });
+    }
+    if let Some((width, height)) = detect_monitor_geometry(None, Some(&window)) {
+        let dimensions = chooser_default_dimensions_for_monitor(width, height);
+        window.set_default_size(dimensions.0, dimensions.1);
+    }
     browser.navigate(Location::local(&state.request.initial_directory));
     window.present();
     if let Some(filename) = state.filename.as_ref() {
@@ -1387,6 +1442,25 @@ fn install_shortcuts(
                 return glib::Propagation::Proceed;
             }
         }
+        if preview.has_video()
+            && state.view.item_view_has_focus()
+            && !alt
+            && !control
+            && !shift
+            && matches!(
+                key,
+                gtk::gdk::Key::space
+                    | gtk::gdk::Key::Up
+                    | gtk::gdk::Key::Down
+                    | gtk::gdk::Key::Left
+                    | gtk::gdk::Key::Right
+                    | gtk::gdk::Key::m
+                    | gtk::gdk::Key::M
+            )
+        {
+            preview.handle_video_key(key);
+            return glib::Propagation::Stop;
+        }
         let mut header_left_boundary = false;
         if state.view.header_actions_have_focus() && !control && !alt {
             match key {
@@ -1467,7 +1541,7 @@ fn install_shortcuts(
             return glib::Propagation::Stop;
         }
         if key == gtk::gdk::Key::space && !control && !alt {
-            preview.toggle(chooser_preview_target(browser.focused_entry()));
+            preview.toggle(preview_target(browser.focused_entry()));
             return glib::Propagation::Stop;
         }
         if key == gtk::gdk::Key::BackSpace && !control && !alt {
@@ -1548,13 +1622,12 @@ fn install_shortcuts(
                 sidebar_state.focus_active_place();
             }
             (gtk::gdk::Key::h | gtk::gdk::Key::Left, false) => state.view.navigate_left(),
-            (
-                gtk::gdk::Key::l
-                | gtk::gdk::Key::Right
-                | gtk::gdk::Key::Return
-                | gtk::gdk::Key::KP_Enter,
-                false,
-            ) => state.view.activate_focused(),
+            (gtk::gdk::Key::Right, false) if state.view.view_mode() == BrowserMode::Columns => {
+                browser.enter_focused_directory();
+            }
+            (gtk::gdk::Key::l | gtk::gdk::Key::Return | gtk::gdk::Key::KP_Enter, false) => {
+                state.view.activate_focused()
+            }
             _ => return glib::Propagation::Proceed,
         }
         glib::Propagation::Stop
