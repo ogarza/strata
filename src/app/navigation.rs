@@ -92,6 +92,9 @@ pub struct NavigationState {
     back_history: Vec<NavigationPath>,
     forward_history: Vec<NavigationPath>,
     preferences: ViewPreferences,
+    /// GTK ListView/GridView can change selection without a user pick (focus,
+    /// pointer-under-row after a rebuild). Those echoes must not arm paste-into.
+    selection_commit: bool,
 }
 
 impl NavigationState {
@@ -119,6 +122,7 @@ impl NavigationState {
 
         self.record_navigation();
         self.peek = None;
+        self.selection_commit = false;
         self.columns.truncate(parent_depth + 1);
         self.push_column(location, request_id);
         self.active_column = self.columns.len().checked_sub(1);
@@ -165,6 +169,7 @@ impl NavigationState {
         request_ids: impl IntoIterator<Item = RequestId>,
     ) {
         self.peek = None;
+        self.selection_commit = false;
         let preferences = self.preferences;
         self.columns = path
             .locations
@@ -685,11 +690,15 @@ impl NavigationState {
             return false;
         };
         let location = entry.location.clone();
-        adopt_selected_locations(column, HashSet::from([location.clone()]));
+        adopt_selected_locations(column, HashSet::from([location.clone()]), true);
         column.selected = Some(position);
         column.selection_anchor = Some(location);
         self.active_column = Some(depth);
         true
+    }
+
+    pub fn commit_selection(&mut self) {
+        self.selection_commit = true;
     }
 
     pub fn set_selection(
@@ -712,7 +721,8 @@ impl NavigationState {
             .iter()
             .map(|position| column.entries[*position].location.clone())
             .collect();
-        adopt_selected_locations(column, locations);
+        let commit = std::mem::take(&mut self.selection_commit);
+        adopt_selected_locations(column, locations, commit);
         column.selected = focused.filter(|position| positions.contains(position));
         if column.selection_anchor.is_none() {
             column.selection_anchor = column
@@ -782,7 +792,7 @@ impl NavigationState {
             .iter()
             .map(|&index| column.entries[index].location.clone())
             .collect();
-        adopt_selected_locations(column, locations);
+        adopt_selected_locations(column, locations, true);
         column.selected = Some(focused);
         self.active_column = Some(depth);
         Some((depth, focused, selected_positions))
@@ -820,7 +830,7 @@ impl NavigationState {
             .iter()
             .map(|position| column.entries[*position].location.clone())
             .collect();
-        adopt_selected_locations(column, locations);
+        adopt_selected_locations(column, locations, true);
         column.selected = Some(focused);
         self.active_column = Some(depth);
         Some(positions)
@@ -869,13 +879,9 @@ impl NavigationState {
     }
 
     pub fn selection_is_load_cursor(&self) -> bool {
-        let Some(column) = self.active_column.and_then(|depth| self.columns.get(depth)) else {
-            return false;
-        };
-        let Some(cursor) = &column.load_cursor else {
-            return false;
-        };
-        column.selected_locations.len() == 1 && column.selected_locations.contains(cursor)
+        self.active_column
+            .and_then(|depth| self.columns.get(depth))
+            .is_some_and(|column| column.load_cursor.is_some())
     }
 
     pub fn move_selection(&mut self, direction: i32) -> Option<(usize, usize)> {
@@ -1099,16 +1105,13 @@ impl NavigationState {
 /// range selections there.
 fn focus_only(column: &mut ColumnState, position: usize) {
     let location = column.entries[position].location.clone();
-    adopt_selected_locations(column, HashSet::from([location.clone()]));
+    adopt_selected_locations(column, HashSet::from([location.clone()]), true);
     column.selected = Some(position);
     column.selection_anchor = Some(location);
 }
 
-fn adopt_selected_locations(column: &mut ColumnState, locations: HashSet<Location>) {
-    if let Some(cursor) = &column.load_cursor
-        && !locations.is_empty()
-        && !(locations.len() == 1 && locations.contains(cursor))
-    {
+fn adopt_selected_locations(column: &mut ColumnState, locations: HashSet<Location>, commit: bool) {
+    if commit {
         column.load_cursor = None;
     }
     column.selected_locations = locations;

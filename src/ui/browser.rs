@@ -600,6 +600,10 @@ impl BrowserView {
         }
     }
 
+    pub fn commit_selection(&self) {
+        self.state.browser.commit_selection();
+    }
+
     pub fn navigate_left(&self) {
         if self.view_mode() != BrowserMode::Columns {
             self.state.browser.parent();

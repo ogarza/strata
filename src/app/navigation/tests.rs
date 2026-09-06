@@ -567,7 +567,7 @@ fn staged_keyboard_descent_selects_the_first_visible_entry() {
 
     assert!(state.set_selection(0, &[], None));
     assert!(
-        !state.selection_is_load_cursor(),
+        state.selection_is_load_cursor(),
         "an empty GTK echo is not itself a paste-into target"
     );
     assert!(state.set_selection(0, &[1], Some(1)));
@@ -576,6 +576,13 @@ fn staged_keyboard_descent_selects_the_first_visible_entry() {
         "restoring the load cursor after an empty echo is still a load cursor"
     );
 
+    assert!(state.set_selection(0, &[0], Some(0)));
+    assert!(
+        state.selection_is_load_cursor(),
+        "GTK focusing another row without a user pick must not arm paste-into"
+    );
+
+    state.commit_selection();
     assert!(state.set_selection(0, &[0], Some(0)));
     assert!(
         !state.selection_is_load_cursor(),

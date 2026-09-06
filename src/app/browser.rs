@@ -1149,6 +1149,10 @@ impl Browser {
         self.state.borrow().selection_is_load_cursor()
     }
 
+    pub fn commit_selection(&self) {
+        self.state.borrow_mut().commit_selection();
+    }
+
     pub fn deletion_entries(&self) -> Vec<FileEntry> {
         let state = self.state.borrow();
         let selected = state.selected_entries();
@@ -1188,6 +1192,7 @@ impl Browser {
         }
         let positions: Vec<_> = (0..count).collect();
         let focused = count - 1;
+        self.commit_selection();
         if self
             .state
             .borrow_mut()
@@ -3250,6 +3255,7 @@ impl Browser {
         let Some(&focused) = positions.last() else {
             return;
         };
+        self.commit_selection();
         self.set_selection(depth, &positions, Some(focused));
         self.emit(BrowserEvent::SelectionSetChanged {
             depth,
