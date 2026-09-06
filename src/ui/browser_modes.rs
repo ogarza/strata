@@ -2058,33 +2058,21 @@ fn build_icons_pane(
     });
     if let Some(groups) = groups.clone() {
         let context = Rc::downgrade(&context);
-        scroll
-            .hadjustment()
-            .connect_page_size_notify(move |adjustment| {
-                let Some(context) = context.upgrade() else {
-                    return;
-                };
-                refresh_group_columns(
-                    &groups,
-                    adjustment.page_size() as i32,
-                    context.density.get(),
-                );
-            });
+        after_icons_viewport_width_changes(&scroll, move |width| {
+            let Some(context) = context.upgrade() else {
+                return;
+            };
+            refresh_group_columns(&groups, width, context.density.get());
+        });
     } else {
         let section = pane_section.clone();
         let context = Rc::downgrade(&context);
-        scroll
-            .hadjustment()
-            .connect_page_size_notify(move |adjustment| {
-                let Some(context) = context.upgrade() else {
-                    return;
-                };
-                pin_ungrouped_icons_columns(
-                    &section,
-                    adjustment.page_size() as i32,
-                    context.density.get(),
-                );
-            });
+        after_icons_viewport_width_changes(&scroll, move |width| {
+            let Some(context) = context.upgrade() else {
+                return;
+            };
+            pin_ungrouped_icons_columns(&section, width, context.density.get());
+        });
     }
     let targets: super::marquee::MarqueeTargets = Rc::new(RefCell::new(Vec::new()));
     let (collection, marquee) =
@@ -2450,11 +2438,45 @@ fn pin_ungrouped_icons_columns(section: &PaneSection, width: i32, density: Brows
         return;
     };
     let column = measured_card_width(section).unwrap_or(FALLBACK_ICONS_COLUMN_WIDTH);
-    let columns = (width / column.max(1)).clamp(1, density_icons_columns(density) as i32) as u32;
+    let columns = icons_columns_for_width(width, column, density);
     // GTK's GridView pool is max_columns*30. Leave min at 1 so cells keep natural width.
+    pin_ungrouped_grid_columns(&icons, columns);
+}
+
+fn icons_columns_for_width(width: i32, column: i32, density: BrowserDensity) -> u32 {
+    (width / column.max(1)).clamp(1, density_icons_columns(density) as i32) as u32
+}
+
+fn pin_ungrouped_grid_columns(icons: &gtk::GridView, columns: u32) {
     if icons.max_columns() != columns {
         icons.set_max_columns(columns.max(icons.min_columns()));
     }
+}
+
+/// GridView applies `max_columns` during allocate, then updates `page-size`.
+/// `queue_resize` from inside that allocate is ignored, so a shrink reflows from
+/// the new width but a grow (closing preview, hiding the sidebar, widening the
+/// window) keeps the old cap. Pin on the next idle instead.
+fn after_icons_viewport_width_changes(
+    scroll: &gtk::ScrolledWindow,
+    on_width: impl Fn(i32) + 'static,
+) {
+    let pending = Rc::new(Cell::new(false));
+    let on_width = Rc::new(on_width);
+    scroll
+        .hadjustment()
+        .connect_page_size_notify(move |adjustment| {
+            if pending.replace(true) {
+                return;
+            }
+            let pending = pending.clone();
+            let on_width = on_width.clone();
+            let adjustment = adjustment.clone();
+            glib::idle_add_local_once(move || {
+                pending.set(false);
+                on_width(adjustment.page_size() as i32);
+            });
+        });
 }
 
 fn pin_grid_columns(icons: &gtk::GridView, columns: u32) {

@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use super::{
-    BrowserMode, ClickActivation, ClickCount, LIST_COLUMN_MIN_WIDTHS, LIST_COLUMN_WIDTHS,
-    MAX_ICONS_THUMBNAIL_SIZE, MIN_ICONS_THUMBNAIL_SIZE, SourceIndexMap, compare_type_groups,
-    icons_card_extent, icons_card_icon_slot, list_column_width, metadata_fill_position,
-    scroll_delta_for_unit, should_activate_pointer_click, type_groups_of, value_type_group,
+    BrowserDensity, BrowserMode, ClickActivation, ClickCount, LIST_COLUMN_MIN_WIDTHS,
+    LIST_COLUMN_WIDTHS, MAX_ICONS_THUMBNAIL_SIZE, MIN_ICONS_THUMBNAIL_SIZE, SourceIndexMap,
+    compare_type_groups, icons_card_extent, icons_card_icon_slot, list_column_width,
+    metadata_fill_position, scroll_delta_for_unit, should_activate_pointer_click, type_groups_of,
+    value_type_group,
 };
 use crate::model::{EntryKind, FileEntry, Location, MetadataValue};
 use crate::test_support::gtk_test;
@@ -116,6 +117,130 @@ fn icons_cards_keep_a_uniform_icon_slot_and_two_line_label() {
     assert_eq!(icons_card_extent(128), (156, 171));
     assert_eq!(icons_card_extent(256), (256, 299));
     assert_eq!(icons_card_extent(512), icons_card_extent(256));
+}
+
+#[test]
+fn icons_columns_follow_viewport_width() {
+    assert_eq!(
+        super::icons_columns_for_width(800, 160, BrowserDensity::Compact),
+        5
+    );
+    assert_eq!(
+        super::icons_columns_for_width(160, 160, BrowserDensity::Compact),
+        1
+    );
+    assert_eq!(
+        super::icons_columns_for_width(80, 160, BrowserDensity::Compact),
+        1
+    );
+    assert_eq!(
+        super::icons_columns_for_width(8000, 160, BrowserDensity::Compact),
+        20
+    );
+    assert_eq!(
+        super::icons_columns_for_width(8000, 160, BrowserDensity::Airy),
+        16
+    );
+}
+
+#[test]
+fn ungrouped_icons_reflow_when_the_preview_split_closes() {
+    gtk_test(
+        "ui::browser_modes::tests::ungrouped_icons_reflow_when_the_preview_split_closes",
+        || {
+            let names: Vec<String> = (0..24).map(|index| format!("item-{index}")).collect();
+            let labels: Vec<&str> = names.iter().map(String::as_str).collect();
+            let factory = gtk::SignalListItemFactory::new();
+            factory.connect_setup(|_, item| {
+                let Some(item) = item.downcast_ref::<gtk::ListItem>() else {
+                    return;
+                };
+                let card = gtk::Box::new(gtk::Orientation::Vertical, 0);
+                card.set_size_request(80, 80);
+                item.set_child(Some(&card));
+            });
+            let grid = gtk::GridView::new(
+                Some(gtk::NoSelection::new(Some(gtk::StringList::new(&labels)))),
+                Some(factory),
+            );
+            grid.set_min_columns(1);
+            grid.set_max_columns(20);
+            grid.set_hexpand(true);
+            grid.set_vexpand(true);
+            let scroll = gtk::ScrolledWindow::builder()
+                .child(&grid)
+                .hscrollbar_policy(gtk::PolicyType::Automatic)
+                .hexpand(true)
+                .vexpand(true)
+                .build();
+            let grid_for_pin = grid.clone();
+            super::after_icons_viewport_width_changes(&scroll, move |width| {
+                super::pin_ungrouped_grid_columns(
+                    &grid_for_pin,
+                    super::icons_columns_for_width(width, 80, BrowserDensity::Compact),
+                );
+            });
+            let preview = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            preview.set_size_request(360, -1);
+            let split = gtk::Paned::new(gtk::Orientation::Horizontal);
+            split.set_resize_start_child(true);
+            split.set_resize_end_child(false);
+            split.set_shrink_start_child(false);
+            split.set_shrink_end_child(true);
+            split.set_start_child(Some(&scroll));
+            let window = gtk::Window::builder()
+                .default_width(900)
+                .default_height(400)
+                .child(&split)
+                .build();
+            window.present();
+            drain_gtk();
+            let open = first_row_columns(&grid);
+            split.set_end_child(Some(&preview));
+            drain_gtk();
+            let with_preview = first_row_columns(&grid);
+            split.set_end_child(None::<&gtk::Widget>);
+            drain_gtk();
+            let closed = first_row_columns(&grid);
+            window.close();
+            assert!(
+                with_preview < open,
+                "opening the preview pane should drop columns ({with_preview} with preview, {open} open)"
+            );
+            assert_eq!(
+                closed, open,
+                "closing the preview pane should restore the grid ({closed} after close, {open} before preview)"
+            );
+        },
+    );
+}
+
+fn drain_gtk() {
+    let context = gtk::glib::MainContext::default();
+    for _ in 0..64 {
+        while context.iteration(false) {}
+        std::thread::sleep(std::time::Duration::from_millis(4));
+    }
+}
+
+fn first_row_columns(view: &impl IsA<gtk::Widget>) -> usize {
+    let view = view.as_ref();
+    let mut tops = Vec::new();
+    let mut child = view.first_child();
+    while let Some(widget) = child {
+        child = widget.next_sibling();
+        let Some(bounds) = widget.compute_bounds(view) else {
+            continue;
+        };
+        if bounds.height() <= 0.0 {
+            continue;
+        }
+        tops.push(bounds.y().round() as i32);
+    }
+    let Some(min_y) = tops.iter().copied().min() else {
+        return 0;
+    };
+    tops.iter().filter(|y| (*y - min_y).abs() <= 1).count()
 }
 
 #[test]
