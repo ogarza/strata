@@ -5,6 +5,7 @@ use crate::model::{FileEntry, Location};
 use crate::ui::browser::paths::is_trash_location;
 use crate::ui::controls::{ModalTone, message_dialog_description, message_dialog_layout};
 use crate::ui::modal::{ModalHost, dismiss_modal_layer, modal_layer, show_error_dialog};
+use crate::ui::terminal;
 use gtk::gio;
 use gtk::prelude::*;
 use std::ffi::OsString;
@@ -168,15 +169,16 @@ pub(in crate::ui) fn launch_terminal(location: &Location, parent: &impl IsA<gtk:
         location = %location.diagnostic_path(),
         "opening terminal"
     );
-    let result = Command::new("xdg-terminal-exec")
+    let result = terminal::command()
         .arg(terminal_directory_argument(&path))
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
         .spawn();
     if let Err(error) = result {
-        tracing::warn!(%error, "unable to launch terminal");
-        show_error_dialog(parent, "Unable to open terminal", &error.to_string());
+        tracing::warn!(%error, launcher = terminal::LAUNCHER, "unable to launch terminal");
+        show_error_dialog(
+            parent,
+            "Unable to open terminal",
+            &terminal::launch_failure(&error),
+        );
     }
 }
 
