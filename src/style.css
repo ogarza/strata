@@ -2881,7 +2881,6 @@ colorchooser colorswatch overlay {
 .icons-card {
   outline: 1px solid transparent;
   outline-offset: -1px;
-  transition: background 220ms ease-out, outline-color 220ms ease-out;
 }
 
 .file-row {
@@ -3563,7 +3562,6 @@ menubutton.icons-thumbnail-menu > button:focus-visible {
   color: @theme_text;
 }
 
-.icons-fast-scroll .icons-card,
 .list-fast-scroll .list-row,
 .list-fast-scroll .file-list-mode row {
   transition: none;

@@ -15,6 +15,9 @@ use crate::{
     sandbox::{Cancellation, ParseOperation},
 };
 
+mod slot;
+pub(crate) use slot::ThumbnailSlot;
+
 static NEXT_REQUEST: AtomicU64 = AtomicU64::new(1);
 const MAX_CACHE_ENTRIES: usize = 256;
 const MAX_CACHE_BYTES: usize = 64 * 1024 * 1024;
@@ -24,7 +27,7 @@ const MAX_QUEUED_THUMBNAILS: usize = 64;
 const FAILED_THUMBNAIL_TTL: Duration = Duration::from_secs(30);
 /// Scroll callbacks re-arm this delay so leftover parks are not fired inside layout.
 const THUMBNAIL_SETTLE_DELAY: Duration = Duration::from_millis(120);
-/// Overlong parks still admit sandbox jobs on a long fling; they do not apply textures.
+/// Overlong parks still admit sandbox jobs on a long fling.
 const MAX_SETTLE_WAIT: Duration = Duration::from_millis(400);
 #[cfg(test)]
 const VIEWPORT_OVERSCAN: f32 = 0.25;
@@ -47,12 +50,12 @@ thread_local! {
 }
 
 struct TrackedThumbnail {
-    image: glib::WeakRef<gtk::Image>,
+    image: glib::WeakRef<ThumbnailSlot>,
     path: PathBuf,
 }
 
 struct TrackedCustomizedIcon {
-    image: glib::WeakRef<gtk::Image>,
+    image: glib::WeakRef<ThumbnailSlot>,
     path: PathBuf,
     icon: String,
     customized: bool,
@@ -60,7 +63,7 @@ struct TrackedCustomizedIcon {
 
 struct ActiveRequest {
     id: u64,
-    image: glib::WeakRef<gtk::Image>,
+    image: glib::WeakRef<ThumbnailSlot>,
     deferred: Option<DeferredThumbnail>,
 }
 
@@ -74,7 +77,7 @@ struct DeferredThumbnail {
 struct PendingTarget {
     image_id: usize,
     request: u64,
-    image: glib::WeakRef<gtk::Image>,
+    image: glib::WeakRef<ThumbnailSlot>,
 }
 struct SettledPark {
     key: ThumbnailKey,
@@ -322,7 +325,7 @@ enum ThumbnailKind {
 }
 
 pub(super) fn set_thumbnail_or_icon(
-    image: &gtk::Image,
+    image: &ThumbnailSlot,
     entry: &FileEntry,
     fallback_icon: &str,
     icon_size: i32,
@@ -350,7 +353,7 @@ pub(super) fn set_thumbnail_or_icon(
 }
 
 pub(super) fn set_thumbnail_or_icon_for_path(
-    image: &gtk::Image,
+    image: &ThumbnailSlot,
     path: &Path,
     fallback_icon: &str,
     icon_size: i32,
@@ -371,7 +374,7 @@ pub(super) fn set_thumbnail_or_icon_for_path(
 
 /// Bundled to stay under the argument-count lint.
 struct ThumbnailRequest<'a> {
-    image: &'a gtk::Image,
+    image: &'a ThumbnailSlot,
     path: &'a Path,
     kind: Option<ThumbnailKind>,
     modified: Option<i64>,
@@ -417,15 +420,11 @@ fn set_thumbnail_for_path(request: ThumbnailRequest<'_>) {
     };
     match THUMBNAIL_CACHE.with(|cache| cache.borrow_mut().get(&key)) {
         Some(CacheHit::Ready(texture)) => {
-            let (image_id, request_id) = set_fallback_icon(
-                request.image,
-                Some(request.path),
-                request.fallback_icon,
-                request.icon_size,
-            );
-            ensure_image_slot(request.image, thumbnail_size);
-            let target = register_active_request(request.image, image_id, request_id);
-            queue_thumbnail_apply(target, texture, path);
+            let (image_id, _) = prepare_thumbnail_target(request.image, thumbnail_size);
+            apply_thumbnail(request.image, &texture, &path);
+            ACTIVE_REQUESTS.with(|requests| {
+                requests.borrow_mut().remove(&image_id);
+            });
             return;
         }
         Some(CacheHit::Failed) => {
@@ -445,9 +444,9 @@ fn set_thumbnail_for_path(request: ThumbnailRequest<'_>) {
         request.fallback_icon,
         request.icon_size,
     );
-    ensure_image_slot(request.image, thumbnail_size);
+    request.image.set_slot(thumbnail_size);
     let target = register_active_request(request.image, image_id, request_id);
-    // Binds run while GTK mutates the widget tree; walking ancestors or hooking the viewport here can corrupt layout. Defer to idle.
+    // Walking ancestors or hooking the viewport during bind can corrupt layout.
     glib::idle_add_local_once(move || {
         if request_is_live(&target) {
             park_thumbnail(key, kind, target, request.wait_for_metadata);
@@ -455,7 +454,7 @@ fn set_thumbnail_for_path(request: ThumbnailRequest<'_>) {
     });
 }
 
-fn viewport_of(image: &gtk::Image) -> Option<gtk::ScrolledWindow> {
+fn viewport_of(image: &impl IsA<gtk::Widget>) -> Option<gtk::ScrolledWindow> {
     let mut ancestor = image.parent();
     while let Some(widget) = ancestor {
         ancestor = widget.parent();
@@ -557,7 +556,8 @@ fn mark_deferred(key: ThumbnailKey, kind: ThumbnailKind, image_id: usize, reques
     });
 }
 
-/// Fires happen only on the main loop: firing inside binds or adjustment callbacks would nest thumbnail application inside GTK layout (reentrant relayout, fatal `bounds.y` assertion). Overdue groups arm a zero-delay timer so the bound holds without ever firing nested.
+/// Fires happen only on the main loop: firing inside binds or adjustment callbacks can walk the
+/// widget tree while GTK is mutating it.
 fn request_group_fire(group: usize) {
     SETTLE_VIEWS.with(|views| {
         let mut views = views.borrow_mut();
@@ -636,14 +636,18 @@ fn request_is_live(target: &PendingTarget) -> bool {
     })
 }
 
-fn target_live_image(target: &PendingTarget) -> Option<gtk::Image> {
+fn target_live_image(target: &PendingTarget) -> Option<ThumbnailSlot> {
     if !request_is_live(target) {
         return None;
     }
     target.image.upgrade()
 }
 
-fn register_active_request(image: &gtk::Image, image_id: usize, request_id: u64) -> PendingTarget {
+fn register_active_request(
+    image: &ThumbnailSlot,
+    image_id: usize,
+    request_id: u64,
+) -> PendingTarget {
     let weak_image = glib::WeakRef::new();
     weak_image.set(Some(image));
     ACTIVE_REQUESTS.with(|requests| {
@@ -663,25 +667,23 @@ fn register_active_request(image: &gtk::Image, image_id: usize, request_id: u64)
     }
 }
 
-fn queue_thumbnail_apply(target: PendingTarget, texture: gdk::Texture, path: PathBuf) {
-    glib::idle_add_local_once(move || {
-        if !request_is_live(&target) {
-            crate::metrics::mark_thumbnail_stale();
-            return;
-        }
-        let Some(image) = target.image.upgrade() else {
-            crate::metrics::mark_thumbnail_stale();
-            ACTIVE_REQUESTS.with(|requests| {
-                requests.borrow_mut().remove(&target.image_id);
-            });
-            return;
-        };
+fn apply_live_thumbnail(target: PendingTarget, texture: gdk::Texture, path: PathBuf) {
+    if !request_is_live(&target) {
+        crate::metrics::mark_thumbnail_stale();
+        return;
+    }
+    let Some(image) = target.image.upgrade() else {
+        crate::metrics::mark_thumbnail_stale();
         ACTIVE_REQUESTS.with(|requests| {
             requests.borrow_mut().remove(&target.image_id);
         });
-        apply_thumbnail(&image, &texture, &path);
-        crate::metrics::mark_thumbnail_applied();
+        return;
+    };
+    ACTIVE_REQUESTS.with(|requests| {
+        requests.borrow_mut().remove(&target.image_id);
     });
+    apply_thumbnail(&image, &texture, &path);
+    crate::metrics::mark_thumbnail_applied();
 }
 
 fn fire_parks(drained: Vec<SettledPark>, viewport: Option<&gtk::ScrolledWindow>) {
@@ -695,7 +697,7 @@ fn fire_parks(drained: Vec<SettledPark>, viewport: Option<&gtk::ScrolledWindow>)
         if let Some(hit) = THUMBNAIL_CACHE.with(|cache| cache.borrow_mut().get(&park.key)) {
             match hit {
                 CacheHit::Ready(texture) => {
-                    queue_thumbnail_apply(park.target, texture, park.key.path);
+                    apply_live_thumbnail(park.target, texture, park.key.path);
                 }
                 CacheHit::Failed => {}
             }
@@ -949,7 +951,7 @@ fn retry_deferred_thumbnails() {
 fn retry_deferred_thumbnail(
     image_id: usize,
     request: u64,
-    image: glib::WeakRef<gtk::Image>,
+    image: glib::WeakRef<ThumbnailSlot>,
     deferred: DeferredThumbnail,
 ) -> bool {
     if !schedule_thumbnail(
@@ -1002,7 +1004,7 @@ fn finish_thumbnail_targets(
             });
             continue;
         };
-        queue_thumbnail_apply(target, texture.clone(), path.to_path_buf());
+        apply_live_thumbnail(target, texture.clone(), path.to_path_buf());
     }
 }
 
@@ -1013,14 +1015,13 @@ fn known_metadata<T: Copy>(value: &MetadataValue<T>) -> Option<T> {
     }
 }
 
-fn apply_thumbnail(image: &gtk::Image, texture: &gdk::Texture, path: &Path) {
-    crate::assets::remove_primary_icon(image);
-    image.set_paintable(Some(texture));
+fn apply_thumbnail(image: &ThumbnailSlot, texture: &gdk::Texture, path: &Path) {
+    image.set_texture(texture);
     image.set_opacity(1.0);
     register_displayed_thumbnail(image, path);
 }
 
-fn displayed_thumbnail_matches(image: &gtk::Image, path: &Path) -> bool {
+fn displayed_thumbnail_matches(image: &ThumbnailSlot, path: &Path) -> bool {
     TRACKED_THUMBNAILS.with(|thumbnails| {
         let mut thumbnails = thumbnails.borrow_mut();
         thumbnails.retain(|tracked| tracked.image.upgrade().is_some());
@@ -1031,7 +1032,7 @@ fn displayed_thumbnail_matches(image: &gtk::Image, path: &Path) -> bool {
     })
 }
 
-fn register_displayed_thumbnail(image: &gtk::Image, path: &Path) {
+fn register_displayed_thumbnail(image: &ThumbnailSlot, path: &Path) {
     let weak_ref = glib::WeakRef::new();
     weak_ref.set(Some(image));
     TRACKED_THUMBNAILS.with(|thumbnails| {
@@ -1051,7 +1052,7 @@ fn register_displayed_thumbnail(image: &gtk::Image, path: &Path) {
     });
 }
 
-fn clear_displayed_thumbnail(image: &gtk::Image) {
+fn clear_displayed_thumbnail(image: &ThumbnailSlot) {
     TRACKED_THUMBNAILS.with(|thumbnails| {
         thumbnails.borrow_mut().retain(|tracked| {
             tracked
@@ -1062,17 +1063,32 @@ fn clear_displayed_thumbnail(image: &gtk::Image) {
     });
 }
 
-pub(super) fn show_fallback_icon(image: &gtk::Image, icon: &str, size: i32) {
+pub(super) fn show_fallback_icon(image: &ThumbnailSlot, icon: &str, size: i32) {
     set_fallback_icon(image, None, icon, size);
 }
 
 pub(super) fn show_customized_icon(
-    image: &gtk::Image,
+    image: &ThumbnailSlot,
     path: &Path,
     fallback_icon: &str,
     size: i32,
 ) {
     set_fallback_icon(image, Some(path), fallback_icon, size);
+}
+
+pub(super) fn show_customized_icon_image(
+    image: &gtk::Image,
+    path: &Path,
+    fallback_icon: &str,
+    size: i32,
+) {
+    if image.pixel_size() != size {
+        image.set_pixel_size(size);
+    }
+    if image.width_request() != size || image.height_request() != size {
+        image.set_size_request(size, size);
+    }
+    apply_path_customization_image(image, path, fallback_icon);
 }
 
 pub(super) fn cancel_list_item_thumbnails(item: &glib::Object) {
@@ -1085,7 +1101,7 @@ pub(super) fn cancel_list_item_thumbnails(item: &glib::Object) {
 }
 
 pub(super) fn cancel_thumbnails_in(widget: &gtk::Widget) {
-    if let Some(image) = widget.downcast_ref::<gtk::Image>() {
+    if let Some(image) = widget.downcast_ref::<ThumbnailSlot>() {
         cancel_thumbnail(image.as_ptr() as usize);
     }
     let mut child = widget.first_child();
@@ -1095,41 +1111,70 @@ pub(super) fn cancel_thumbnails_in(widget: &gtk::Widget) {
     }
 }
 
-pub(super) fn ensure_image_slot(image: &gtk::Image, size: i32) {
-    if image.pixel_size() != size {
-        image.set_pixel_size(size);
-    }
-    if image.width_request() != size || image.height_request() != size {
-        image.set_size_request(size, size);
-    }
-}
-
-fn prepare_thumbnail_target(image: &gtk::Image, size: i32) -> (usize, u64) {
+fn prepare_thumbnail_target(image: &ThumbnailSlot, size: i32) -> (usize, u64) {
     let request = NEXT_REQUEST.fetch_add(1, Ordering::Relaxed);
     let image_id = image.as_ptr() as usize;
     cancel_thumbnail(image_id);
-    ensure_image_slot(image, size);
+    image.set_slot(size);
     (image_id, request)
 }
 
 fn set_fallback_icon(
-    image: &gtk::Image,
+    image: &ThumbnailSlot,
     path: Option<&Path>,
     icon: &str,
     size: i32,
 ) -> (usize, u64) {
     let ids = prepare_thumbnail_target(image, size);
     clear_displayed_thumbnail(image);
+    let (texture, customized) = path_icon_texture(path, icon);
+    image.set_fallback(icon, texture.as_ref());
     if let Some(p) = path {
-        let customized = apply_path_customization(image, p, icon);
         register_tracked_icon(image, p, icon, customized);
-    } else {
-        crate::assets::set_primary_icon(image, icon);
     }
     ids
 }
 
-fn apply_path_customization(image: &gtk::Image, path: &Path, fallback_icon: &str) -> bool {
+fn path_icon_texture(path: Option<&Path>, fallback_icon: &str) -> (Option<gdk::Texture>, bool) {
+    let Some(path) = path else {
+        return (crate::assets::primary_icon_paintable(fallback_icon), false);
+    };
+    let theme_manager = super::theme::ThemeManager::shared();
+    let custom_icon = theme_manager.custom_icon(path);
+    let color = theme_manager.folder_color(path);
+    let customized = custom_icon.is_some() || color.is_some();
+    let texture = if fallback_icon == crate::assets::icons::FOLDER
+        && let Some(decoration) = custom_icon.as_deref()
+    {
+        let color = color
+            .as_ref()
+            .map_or_else(crate::assets::primary_icon_color, |color| {
+                color.hex().to_owned()
+            });
+        crate::assets::folder_decoration_paintable(decoration, &color)
+    } else if let Some(emoji) = custom_icon
+        .as_deref()
+        .and_then(crate::assets::icons::custom_emoji)
+    {
+        crate::assets::emoji_icon_paintable(emoji)
+    } else {
+        let rendered_icon = custom_icon.as_deref().unwrap_or(fallback_icon);
+        if let Some(color) = color {
+            crate::assets::custom_colored_icon_paintable(rendered_icon, color.hex())
+        } else {
+            crate::assets::primary_icon_paintable(rendered_icon)
+        }
+    };
+    (texture, customized)
+}
+
+fn apply_path_customization(image: &ThumbnailSlot, path: &Path, fallback_icon: &str) -> bool {
+    let (texture, customized) = path_icon_texture(Some(path), fallback_icon);
+    image.set_fallback(fallback_icon, texture.as_ref());
+    customized
+}
+
+fn apply_path_customization_image(image: &gtk::Image, path: &Path, fallback_icon: &str) -> bool {
     let theme_manager = super::theme::ThemeManager::shared();
     let custom_icon = theme_manager.custom_icon(path);
     let color = theme_manager.folder_color(path);
@@ -1160,7 +1205,7 @@ fn apply_path_customization(image: &gtk::Image, path: &Path, fallback_icon: &str
     customized
 }
 
-fn register_tracked_icon(image: &gtk::Image, path: &Path, icon: &str, customized: bool) {
+fn register_tracked_icon(image: &ThumbnailSlot, path: &Path, icon: &str, customized: bool) {
     let weak_ref = glib::WeakRef::new();
     weak_ref.set(Some(image));
     TRACKED_CUSTOMIZED_ICONS.with(|icons| {
@@ -1189,7 +1234,7 @@ pub(super) fn refresh_customized_icons(paths: &[PathBuf]) {
 }
 
 pub(super) fn refresh_all_customized_icons() {
-    refresh_tracked_icons(|tracked| tracked.customized);
+    refresh_tracked_icons(|_| true);
 }
 
 fn refresh_tracked_icons(matches: impl Fn(&TrackedCustomizedIcon) -> bool) {
@@ -1199,7 +1244,7 @@ fn refresh_tracked_icons(matches: impl Fn(&TrackedCustomizedIcon) -> bool) {
             let Some(image) = tracked.image.upgrade() else {
                 return false;
             };
-            if matches(tracked) {
+            if matches(tracked) && image.texture().is_none() {
                 cancel_thumbnail(image.as_ptr() as usize);
                 tracked.customized = apply_path_customization(&image, &tracked.path, &tracked.icon);
             }

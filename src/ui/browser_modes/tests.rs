@@ -344,6 +344,22 @@ fn icons_scrolling_bind_still_requests_thumbnail_and_settle_fills_chrome() {
                     break;
                 }
             }
+            assert!(
+                !crate::ui::thumbnail::has_pending_thumbnail(&path),
+                "scrolling bind must not enqueue thumbnail work"
+            );
+            crate::ui::thumbnail::set_thumbnail_or_icon(
+                &icon,
+                &entry,
+                crate::assets::icons::PICTURES,
+                64,
+                64,
+            );
+            for _ in 0..64 {
+                if !context.iteration(false) {
+                    break;
+                }
+            }
             assert!(crate::ui::thumbnail::has_pending_thumbnail(&path));
             let job = crate::ui::thumbnail::pending_thumbnail_id(&path);
             let mut cuts = HashSet::new();

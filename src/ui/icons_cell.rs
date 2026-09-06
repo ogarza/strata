@@ -18,7 +18,7 @@ pub(super) fn new_card(slot: i32) -> gtk::Box {
     card.set_halign(gtk::Align::Fill);
     card.set_valign(gtk::Align::Start);
 
-    let icon = gtk::Image::new();
+    let icon = super::thumbnail::ThumbnailSlot::new(slot);
     icon.add_css_class("icons-card-icon");
     icon.set_halign(gtk::Align::Center);
     icon.set_valign(gtk::Align::Start);
@@ -38,8 +38,13 @@ pub(super) fn new_card(slot: i32) -> gtk::Box {
     card
 }
 
-pub(super) fn parts(card: &impl IsA<gtk::Widget>) -> Option<(gtk::Image, gtk::Inscription)> {
-    let icon = card.first_child()?.downcast::<gtk::Image>().ok()?;
+pub(super) fn parts(
+    card: &impl IsA<gtk::Widget>,
+) -> Option<(super::thumbnail::ThumbnailSlot, gtk::Inscription)> {
+    let icon = card
+        .first_child()?
+        .downcast::<super::thumbnail::ThumbnailSlot>()
+        .ok()?;
     let labels = card.last_child()?.downcast::<gtk::Overlay>().ok()?;
     let label = labels.child()?.downcast::<gtk::Inscription>().ok()?;
     Some((icon, label))
@@ -79,7 +84,7 @@ pub(super) fn set_slot(card: &gtk::Box, thumbnail_size: i32) {
         card.set_size_request(width, height);
     }
     if let Some((icon, _)) = parts(card) {
-        super::thumbnail::ensure_image_slot(&icon, slot);
+        icon.set_slot(slot);
     }
     if let Some(labels) = card.last_child() {
         labels.set_height_request(ICONS_CARD_LABEL_LINE_PX * ICONS_CARD_LABEL_LINES);

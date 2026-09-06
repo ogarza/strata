@@ -14,8 +14,7 @@ fn card_keeps_a_fixed_size_request() {
             assert_eq!(card.width_request(), width);
             assert_eq!(card.height_request(), height);
             let (icon, _) = parts(&card).expect("icon and label");
-            icon.set_pixel_size(512);
-            icon.set_size_request(512, 256);
+            icon.set_slot(512);
             set_slot(&card, 64);
             assert_eq!(card.width_request(), width);
             assert_eq!(card.height_request(), height);

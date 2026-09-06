@@ -2005,6 +2005,18 @@ fn build_icons_pane(
             }
             if let Some(groups) = groups_for_pane.as_ref() {
                 refresh_group_columns(groups, groups.container.width(), density_for_size);
+            } else {
+                let density = loading_context
+                    .upgrade()
+                    .map(|context| context.density.get())
+                    .unwrap_or(density_for_size);
+                for section in sections.borrow().iter() {
+                    pin_ungrouped_icons_columns(
+                        section,
+                        viewport_page_width(&section.view),
+                        density,
+                    );
+                }
             }
         });
 
@@ -2026,29 +2038,24 @@ fn build_icons_pane(
     let sections_for_settle = context.sections.clone();
     let cuts_for_settle = context.cuts.clone();
     let depth_for_settle = context.depth;
-    install_scroll_settle(
-        &scroll,
-        context.scrolling.clone(),
-        "icons-fast-scroll",
-        move || {
-            let Some(browser) = browser_for_settle.upgrade() else {
-                return;
-            };
-            let Some(sections) = sections_for_settle.upgrade() else {
-                return;
-            };
-            let cuts = cuts_for_settle.borrow();
-            for section in sections.borrow().iter() {
-                refresh_icons_section(
-                    &browser,
-                    depth_for_settle,
-                    &source_index_for_settle,
-                    section,
-                    &cuts,
-                );
-            }
-        },
-    );
+    install_scroll_settle(&scroll, context.scrolling.clone(), None, move || {
+        let Some(browser) = browser_for_settle.upgrade() else {
+            return;
+        };
+        let Some(sections) = sections_for_settle.upgrade() else {
+            return;
+        };
+        let cuts = cuts_for_settle.borrow();
+        for section in sections.borrow().iter() {
+            refresh_icons_section(
+                &browser,
+                depth_for_settle,
+                &source_index_for_settle,
+                section,
+                &cuts,
+            );
+        }
+    });
     if let Some(groups) = groups.clone() {
         let context = Rc::downgrade(&context);
         scroll
@@ -2059,6 +2066,21 @@ fn build_icons_pane(
                 };
                 refresh_group_columns(
                     &groups,
+                    adjustment.page_size() as i32,
+                    context.density.get(),
+                );
+            });
+    } else {
+        let section = pane_section.clone();
+        let context = Rc::downgrade(&context);
+        scroll
+            .hadjustment()
+            .connect_page_size_notify(move |adjustment| {
+                let Some(context) = context.upgrade() else {
+                    return;
+                };
+                pin_ungrouped_icons_columns(
+                    &section,
                     adjustment.page_size() as i32,
                     context.density.get(),
                 );
@@ -2260,7 +2282,7 @@ fn build_icons_view(
             } else {
                 crate::assets::icons::DOCUMENTS
             };
-            crate::assets::set_primary_icon(&icon, icon_name);
+            crate::ui::thumbnail::show_fallback_icon(&icon, icon_name, thumbnail_size);
             icon.set_opacity(1.0);
             label.set_visible(false);
             let Some(field) = super::icons_cell::ensure_rename_field(&card) else {
@@ -2416,17 +2438,47 @@ fn refresh_group_columns(groups: &Rc<IconsGroups>, width: i32, density: BrowserD
         let Ok(icons) = group.section.view.clone().downcast::<gtk::GridView>() else {
             continue;
         };
-        if icons.min_columns() == columns && icons.max_columns() == columns {
-            continue;
-        }
-        if columns > icons.max_columns() {
-            icons.set_max_columns(columns);
-            icons.set_min_columns(columns);
-        } else {
-            icons.set_min_columns(columns);
-            icons.set_max_columns(columns);
+        pin_grid_columns(&icons, columns);
+    }
+}
+
+fn pin_ungrouped_icons_columns(section: &PaneSection, width: i32, density: BrowserDensity) {
+    if width <= 0 {
+        return;
+    }
+    let Ok(icons) = section.view.clone().downcast::<gtk::GridView>() else {
+        return;
+    };
+    let column = measured_card_width(section).unwrap_or(FALLBACK_ICONS_COLUMN_WIDTH);
+    let columns = (width / column.max(1)).clamp(1, density_icons_columns(density) as i32) as u32;
+    // GTK's GridView pool is max_columns*30. Leave min at 1 so cells keep natural width.
+    if icons.max_columns() != columns {
+        icons.set_max_columns(columns.max(icons.min_columns()));
+    }
+}
+
+fn pin_grid_columns(icons: &gtk::GridView, columns: u32) {
+    if icons.min_columns() == columns && icons.max_columns() == columns {
+        return;
+    }
+    if columns > icons.max_columns() {
+        icons.set_max_columns(columns);
+        icons.set_min_columns(columns);
+    } else {
+        icons.set_min_columns(columns);
+        icons.set_max_columns(columns);
+    }
+}
+
+fn viewport_page_width(widget: &gtk::Widget) -> i32 {
+    let mut ancestor = widget.parent();
+    while let Some(widget) = ancestor {
+        ancestor = widget.parent();
+        if let Ok(scroll) = widget.downcast::<gtk::ScrolledWindow>() {
+            return scroll.hadjustment().page_size() as i32;
         }
     }
+    widget.width()
 }
 
 fn measured_card_width(section: &PaneSection) -> Option<i32> {
@@ -2452,7 +2504,7 @@ fn refresh_marquee_targets(pane: &Pane) {
 fn install_scroll_settle(
     scroll: &gtk::ScrolledWindow,
     scrolling: Rc<Cell<bool>>,
-    css_class: &'static str,
+    css_class: Option<&'static str>,
     on_settle: impl Fn() + 'static,
 ) {
     let pending = Rc::new(RefCell::new(None::<glib::SourceId>));
@@ -2464,7 +2516,7 @@ fn install_scroll_settle(
         let on_settle = on_settle.clone();
         adjustment.connect_value_changed(move |_| {
             let started = !scrolling.replace(true);
-            if started {
+            if started && let Some(css_class) = css_class {
                 let scrolling = scrolling.clone();
                 let scroll = scroll.clone();
                 glib::idle_add_local_once(move || {
@@ -2485,7 +2537,9 @@ fn install_scroll_settle(
                 move || {
                     pending_for_timeout.borrow_mut().take();
                     scrolling.set(false);
-                    scroll.remove_css_class(css_class);
+                    if let Some(css_class) = css_class {
+                        scroll.remove_css_class(css_class);
+                    }
                     on_settle();
                 },
             )));
@@ -2527,6 +2581,10 @@ fn configure_icons_density(pane: &Pane, density: BrowserDensity) {
     }
     if let Some(groups) = pane.groups.as_ref() {
         refresh_group_columns(groups, groups.container.width(), density);
+    } else {
+        for section in pane.all_sections() {
+            pin_ungrouped_icons_columns(&section, viewport_page_width(&section.view), density);
+        }
     }
 }
 
@@ -3002,7 +3060,7 @@ fn build_list_pane(
             } else {
                 crate::assets::icons::DOCUMENTS
             };
-            crate::assets::set_primary_icon(&icon, icon_name);
+            crate::ui::thumbnail::show_fallback_icon(&icon, icon_name, 18);
             name.set_visible(false);
             field.set_visible(true);
             mode.set_label("");
@@ -3073,7 +3131,7 @@ fn build_list_pane(
     let source_index_for_settle = source_index.clone();
     let sections_for_settle = Rc::downgrade(&sections);
     let cuts_for_settle = cut_locations.clone();
-    install_scroll_settle(&scroll, scrolling, "list-fast-scroll", move || {
+    install_scroll_settle(&scroll, scrolling, Some("list-fast-scroll"), move || {
         let Some(browser) = browser_for_settle.upgrade() else {
             return;
         };
@@ -4026,8 +4084,7 @@ fn assemble_list_row() -> gtk::Box {
     row.add_css_class("list-row");
     let name_cell = gtk::Box::new(gtk::Orientation::Horizontal, 12);
     name_cell.add_css_class("list-name-cell");
-    let icon = gtk::Image::new();
-    icon.set_pixel_size(18);
+    let icon = super::thumbnail::ThumbnailSlot::new(18);
     let name = gtk::Label::new(None);
     name.add_css_class("alternate-rename-label");
     name.set_xalign(0.0);
@@ -4054,7 +4111,7 @@ fn assemble_list_row() -> gtk::Box {
 fn list_row_parts(
     row: &gtk::Box,
 ) -> Option<(
-    gtk::Image,
+    super::thumbnail::ThumbnailSlot,
     gtk::Label,
     gtk::Entry,
     gtk::Label,
@@ -4063,7 +4120,10 @@ fn list_row_parts(
     gtk::Label,
 )> {
     let name_cell = row.first_child()?.downcast::<gtk::Box>().ok()?;
-    let icon = name_cell.first_child()?.downcast::<gtk::Image>().ok()?;
+    let icon = name_cell
+        .first_child()?
+        .downcast::<super::thumbnail::ThumbnailSlot>()
+        .ok()?;
     let name = icon.next_sibling()?.downcast::<gtk::Label>().ok()?;
     let field = name.next_sibling()?.downcast::<gtk::Entry>().ok()?;
     let mode = name_cell.next_sibling()?.downcast::<gtk::Label>().ok()?;
@@ -4097,14 +4157,20 @@ fn apply_icons_entry(
     if label.text().as_deref() != Some(entry.display_name.as_str()) {
         label.set_text(Some(&entry.display_name));
     }
-    super::thumbnail::set_thumbnail_or_icon(
-        &icon,
-        entry,
-        super::browser::entry_icon(entry),
-        thumbnail_size,
-        thumbnail_size,
-    );
-    if !scrolling {
+    if scrolling {
+        super::thumbnail::show_fallback_icon(
+            &icon,
+            super::browser::entry_icon(entry),
+            thumbnail_size,
+        );
+    } else {
+        super::thumbnail::set_thumbnail_or_icon(
+            &icon,
+            entry,
+            super::browser::entry_icon(entry),
+            thumbnail_size,
+            thumbnail_size,
+        );
         refresh_icons_card_chrome(item, card, &icon, &label, entry, cuts);
     }
 }
@@ -4112,7 +4178,7 @@ fn apply_icons_entry(
 fn refresh_icons_card_chrome(
     item: Option<&gtk::ListItem>,
     card: &gtk::Box,
-    icon: &gtk::Image,
+    icon: &super::thumbnail::ThumbnailSlot,
     label: &gtk::Inscription,
     entry: &FileEntry,
     cuts: &HashSet<Location>,
@@ -4149,6 +4215,13 @@ fn refresh_icons_section(
             return;
         };
         refresh_icons_card_chrome(Some(&item), &card, &icon, &label, &entry, cuts);
+        super::thumbnail::set_thumbnail_or_icon(
+            &icon,
+            &entry,
+            super::browser::entry_icon(&entry),
+            icon.slot_size(),
+            icon.slot_size(),
+        );
         if let Some(position) = metadata_fill_position(Some(position), &entry, false) {
             browser.request_metadata_fill(depth, position, entry.location.clone());
         }

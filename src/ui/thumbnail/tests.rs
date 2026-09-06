@@ -518,11 +518,11 @@ fn drain_main_loop() {
     }
 }
 
-fn displayed_texture(image: &gtk::Image) -> Option<gdk::Texture> {
-    image.paintable()?.downcast::<gdk::Texture>().ok()
+fn displayed_texture(image: &super::ThumbnailSlot) -> Option<gdk::Texture> {
+    image.texture()
 }
 
-fn bind_thumbnail(image: &gtk::Image, entry: &FileEntry) {
+fn bind_thumbnail(image: &super::ThumbnailSlot, entry: &FileEntry) {
     set_thumbnail_or_icon(image, entry, crate::assets::icons::PICTURES, 64, 64);
 }
 
@@ -545,12 +545,26 @@ fn cache_hit_applies_texture_on_idle_not_during_bind() {
                     texture.clone(),
                 );
             });
-            let image = gtk::Image::new();
+            let image = super::ThumbnailSlot::new(64);
             bind_thumbnail(&image, &sample_entry(&path));
-            assert_ne!(displayed_texture(&image).as_ref(), Some(&texture));
-            drain_main_loop();
             assert_eq!(displayed_texture(&image).as_ref(), Some(&texture));
             clear_thumbnail_runtime();
+        },
+    );
+}
+
+#[test]
+fn texture_swap_does_not_queue_resize() {
+    gtk_test(
+        "ui::thumbnail::tests::texture_swap_does_not_queue_resize",
+        || {
+            let image = super::ThumbnailSlot::new(64);
+            let before = image.measure(gtk::Orientation::Horizontal, -1);
+            let resizes = image.resize_calls();
+            image.set_texture(&sample_texture());
+            image.set_fallback(crate::assets::icons::PICTURES, Some(&sample_texture()));
+            assert_eq!(image.resize_calls(), resizes);
+            assert_eq!(image.measure(gtk::Orientation::Horizontal, -1), before);
         },
     );
 }
@@ -563,7 +577,7 @@ fn cache_miss_enqueues_sandbox_job_without_settle_timeout() {
             super::super::theme::ThemeManager::shared();
             hold_thumbnail_workers();
             let path = PathBuf::from("/fixture/cache-miss.png");
-            let image = gtk::Image::new();
+            let image = super::ThumbnailSlot::new(64);
             bind_thumbnail(&image, &sample_entry(&path));
             drain_main_loop();
             assert!(has_pending_thumbnail(&path));
@@ -586,7 +600,7 @@ fn stale_request_id_does_not_apply_completed_texture() {
         || {
             super::super::theme::ThemeManager::shared();
             let path = PathBuf::from("/fixture/stale.png");
-            let image = gtk::Image::new();
+            let image = super::ThumbnailSlot::new(64);
             let image_id = image.as_ptr() as usize;
             let weak = glib::WeakRef::new();
             weak.set(Some(&image));
