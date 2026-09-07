@@ -600,9 +600,23 @@ fn mark_deferred(key: ThumbnailKey, kind: ThumbnailKind, image_id: usize, reques
     });
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ViewportActivity {
+    GeometryChanged,
+    ValueChanged,
+}
+
+fn fire_delay(activity: ViewportActivity, overdue: bool) -> Duration {
+    if overdue || activity == ViewportActivity::GeometryChanged {
+        Duration::ZERO
+    } else {
+        THUMBNAIL_SETTLE_DELAY
+    }
+}
+
 /// Fires happen only on the main loop: firing inside binds or adjustment callbacks can walk the
 /// widget tree while GTK is mutating it.
-fn request_group_fire(group: usize) {
+fn request_group_fire(group: usize, activity: ViewportActivity) {
     SETTLE_VIEWS.with(|views| {
         let mut views = views.borrow_mut();
         let Some(settle) = views.get_mut(&group) else {
@@ -618,11 +632,7 @@ fn request_group_fire(group: usize) {
         if let Some(timer) = settle.timer.take() {
             timer.remove();
         }
-        let delay = if overdue {
-            Duration::ZERO
-        } else {
-            THUMBNAIL_SETTLE_DELAY
-        };
+        let delay = fire_delay(activity, overdue);
         settle.timer = Some(glib::timeout_add_local_once(delay, move || {
             fire_view_group(group);
         }));
@@ -640,8 +650,11 @@ fn hook_viewport(group: usize, viewport: &gtk::ScrolledWindow) {
         return;
     }
     for adjustment in [viewport.vadjustment(), viewport.hadjustment()] {
-        adjustment.connect_value_changed(move |_| request_group_fire(group));
-        adjustment.connect_changed(move |_| request_group_fire(group));
+        adjustment.connect_value_changed(move |_| {
+            request_group_fire(group, ViewportActivity::ValueChanged)
+        });
+        adjustment
+            .connect_changed(move |_| request_group_fire(group, ViewportActivity::GeometryChanged));
     }
 }
 

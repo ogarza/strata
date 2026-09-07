@@ -14,11 +14,11 @@ use super::{
     MAX_PERSIST_QUEUE, MAX_QUEUED_THUMBNAILS, MAX_THUMBNAIL_WORKERS, PENDING_THUMBNAILS,
     PendingTarget, PendingThumbnail, PersistJob, PersistQueue, SETTLE_VIEWS, THUMBNAIL_CACHE,
     THUMBNAIL_QUEUE, ThumbnailCache, ThumbnailJob, ThumbnailKey, ThumbnailKind, ThumbnailQueue,
-    ViewSettle, cancel_thumbnail, clear_thumbnail_runtime, finish_thumbnail_decode,
-    finish_thumbnail_targets, fire_settled_thumbnails, has_pending_thumbnail,
-    hold_thumbnail_workers, is_heavy, persistent_pool_operation, refresh_all_customized_icons,
-    resolve_source_key, schedule_or_defer, set_thumbnail_or_icon, should_promote_invalid_cache,
-    show_customized_icon, take_pending_targets, thumbnail_kind,
+    ViewSettle, ViewportActivity, cancel_thumbnail, clear_thumbnail_runtime,
+    finish_thumbnail_decode, finish_thumbnail_targets, fire_delay, fire_settled_thumbnails,
+    has_pending_thumbnail, hold_thumbnail_workers, is_heavy, persistent_pool_operation,
+    refresh_all_customized_icons, resolve_source_key, schedule_or_defer, set_thumbnail_or_icon,
+    should_promote_invalid_cache, show_customized_icon, take_pending_targets, thumbnail_kind,
 };
 use crate::{
     model::{EntryKind, FileEntry, Location, MetadataValue},
@@ -32,6 +32,22 @@ fn key(index: usize) -> ThumbnailKey {
         modified: Some(1),
         file_size: Some(1),
     }
+}
+
+#[test]
+fn geometry_changes_do_not_reimpose_the_scroll_settle_delay() {
+    assert_eq!(
+        fire_delay(ViewportActivity::GeometryChanged, false),
+        Duration::ZERO
+    );
+    assert_eq!(
+        fire_delay(ViewportActivity::ValueChanged, false),
+        super::THUMBNAIL_SETTLE_DELAY
+    );
+    assert_eq!(
+        fire_delay(ViewportActivity::ValueChanged, true),
+        Duration::ZERO
+    );
 }
 
 #[test]
