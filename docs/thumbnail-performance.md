@@ -37,6 +37,19 @@ The parent-side snapshot helper opens raster sources with `CLOEXEC` and `NONBLOC
 
 The accepted S2 tradeoff means native decoder state can persist across raster files inside a worker. D06b documents that blast radius but does not implement per-file disposable decoder children. The accepted S3 scope keeps parent-side bounded PNG decoding for shared-cache entries and validated helper outputs; allocation and transport validation do not prove codec safety.
 
+## D10 fixed total render policy
+
+D10 fixes the process-wide total thumbnail render limit at four. The scheduler
+applies this same limit to raster, PDF, RAW, video, and every one-shot fallback;
+the persistent pool uses the same four-worker ceiling. Workers still grow lazily
+only when admitted work needs one, and retire safely after idle timeout. The
+existing heavy subset limit remains one within the total limit. Staging, memory,
+and idle-resident safeguards remain independent of CPU count.
+
+There is intentionally no user-facing worker preference: the four-slot behavior
+is the established D00/D07 comparison baseline, while decoder subprocesses and
+provider internals may use additional threads.
+
 ## D09 idle viewport scheduling
 
 Thumbnail bind/park admission already avoids a settle timeout for an idle initial viewport. D09 narrows the remaining viewport debounce: adjustment value changes still use the 120 ms scroll settle delay and the 400 ms starvation cap, but geometry/content-only adjustment changes schedule the next main-loop fire without imposing another scroll delay. This keeps firing out of GTK bind/adjustment callbacks while avoiding a redundant wait from relayout or content-size notifications.

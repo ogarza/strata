@@ -23,7 +23,7 @@ pub(crate) use slot::ThumbnailSlot;
 static NEXT_REQUEST: AtomicU64 = AtomicU64::new(1);
 const MAX_CACHE_ENTRIES: usize = 256;
 const MAX_CACHE_BYTES: usize = 64 * 1024 * 1024;
-/// Viewport bounding keeps the admitted work fixed.
+/// One process-wide bound covers raster, heavy, and one-shot fallback renders.
 const MAX_THUMBNAIL_WORKERS: usize = 4;
 const MAX_QUEUED_THUMBNAILS: usize = 64;
 const FAILED_THUMBNAIL_TTL: Duration = Duration::from_secs(30);
