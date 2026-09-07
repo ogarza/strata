@@ -167,7 +167,12 @@ fn pump_persist_queue() {
                 break;
             };
             // Best effort: store failures are dropped; the in-memory result already applied.
+            let started = std::time::Instant::now();
             super::thumbnail_cache::store(&job.path, job.mtime, &job.png);
+            crate::metrics::record_thumbnail_stage(
+                crate::metrics::ThumbnailStage::Persist,
+                started.elapsed(),
+            );
         }
         PERSIST_RUNNING.store(false, Ordering::SeqCst);
         // A job enqueued after the drain but before the flag cleared
@@ -874,18 +879,31 @@ async fn run_thumbnail_job(job: ThumbnailJob) {
     let key = job.key.clone();
     let path = key.path.clone();
     let result = gio::spawn_blocking(move || {
-        if let Some(mtime) = job.key.modified
-            && let Some(png) = super::thumbnail_cache::lookup(&job.key.path, mtime)
-        {
+        let lookup_started = std::time::Instant::now();
+        let cached = job
+            .key
+            .modified
+            .and_then(|mtime| super::thumbnail_cache::lookup(&job.key.path, mtime));
+        crate::metrics::record_thumbnail_stage(
+            crate::metrics::ThumbnailStage::Lookup,
+            lookup_started.elapsed(),
+        );
+        if let Some(png) = cached {
             return Ok((png, false));
         }
-        render_thumbnail(
+        let render_started = std::time::Instant::now();
+        let result = render_thumbnail(
             &job.key.path,
             job.kind,
             super::thumbnail_cache::CANONICAL_MAX_EDGE,
             &job.cancellation,
         )
-        .map(|png| (png, true))
+        .map(|png| (png, true));
+        crate::metrics::record_thumbnail_stage(
+            crate::metrics::ThumbnailStage::Render,
+            render_started.elapsed(),
+        );
+        result
     })
     .await;
     let targets = take_pending_targets(&key, job_id);

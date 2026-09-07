@@ -21,6 +21,21 @@ static THUMB_APPLIED: AtomicU64 = AtomicU64::new(0);
 static THUMB_CANCELLED: AtomicU64 = AtomicU64::new(0);
 static THUMB_STALE: AtomicU64 = AtomicU64::new(0);
 
+static THUMB_STAGE_CALLS: [AtomicU64; 5] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+static THUMB_STAGE_MICROS: [AtomicU64; 5] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
 pub fn initialize() {
     let _started = STARTED.set(Instant::now());
 }
@@ -113,6 +128,44 @@ pub fn mark_thumbnail_started() {
         total = THUMB_STARTED.load(Ordering::Relaxed),
         "thumbnail started"
     );
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(usize)]
+#[expect(
+    dead_code,
+    reason = "later thumbnail stages land with their pipeline diffs"
+)]
+pub enum ThumbnailStage {
+    Lookup = 0,
+    Render = 1,
+    ParentDecode = 2,
+    Persist = 3,
+    Apply = 4,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg(test)]
+pub struct ThumbnailStageStats {
+    pub calls: u64,
+    pub total_micros: u64,
+}
+
+pub fn record_thumbnail_stage(stage: ThumbnailStage, elapsed: std::time::Duration) {
+    let index = stage as usize;
+    THUMB_STAGE_CALLS[index].fetch_add(1, Ordering::Relaxed);
+    let elapsed_micros = elapsed.as_micros().min(u64::MAX as u128) as u64;
+    THUMB_STAGE_MICROS[index].fetch_add(elapsed_micros, Ordering::Relaxed);
+    tracing::debug!(?stage, elapsed_micros, "thumbnail stage completed");
+}
+
+#[cfg(test)]
+pub fn thumbnail_stage_stats(stage: ThumbnailStage) -> ThumbnailStageStats {
+    let index = stage as usize;
+    ThumbnailStageStats {
+        calls: THUMB_STAGE_CALLS[index].load(Ordering::Relaxed),
+        total_micros: THUMB_STAGE_MICROS[index].load(Ordering::Relaxed),
+    }
 }
 
 pub fn mark_thumbnail_completed() {

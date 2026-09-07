@@ -23,6 +23,15 @@ fn thumbnail_counters_are_monotonic() {
 }
 
 #[test]
+fn stage_timing_accumulates_samples() {
+    let before = thumbnail_stage_stats(ThumbnailStage::Lookup);
+    record_thumbnail_stage(ThumbnailStage::Lookup, std::time::Duration::from_micros(7));
+    let after = thumbnail_stage_stats(ThumbnailStage::Lookup);
+    assert_eq!(after.calls, before.calls + 1);
+    assert_eq!(after.total_micros, before.total_micros + 7);
+}
+
+#[test]
 fn stage_probes_do_not_panic() {
     record_stage("test-enumeration", 3);
     mark_first_themed_frame();
