@@ -1,5 +1,16 @@
 # Thumbnail performance
 
+## Scroll-settle tuning (R3, issue #516)
+
+Icons/List now resume thumbnail admission after 20 ms without a scroll adjustment,
+down from 80 ms. Each adjustment still resets the timer, and viewport-first
+scheduling and allocation checks remain in place. This removes 60 ms of intentional
+quiet-period delay; it does not guarantee processing or completion by the second
+display frame. Compare post-scroll fill time and work admitted during flings using
+the disposable fixtures below. Keep worker count and build profile fixed when
+comparing delays. To roll back this tuning, restore the delay to 80 ms without
+reverting other thumbnail work or touching personal caches.
+
 ## Viewport-first scheduling (R2, issue #516)
 
 Thumbnail admission now uses allocated widget geometry, not just GTK bind order.
@@ -27,7 +38,7 @@ containers are all checked, including horizontal clipping in Columns.
   heavy lane does not prevent useful raster work. Already-dispatched executions
   retain their IDs, permits, revision validation, and reattachment opportunities;
   scrolling never kills a worker to free capacity.
-- Icons/List retain the existing 80 ms quiet-period bind gate. It also pauses
+- Icons/List use a quiet-period bind gate (20 ms after R3 tuning). It also pauses
   admission of already-parked requests for that viewport; another window's idle
   viewport can continue. Same-file texture preservation from R1 is unchanged.
 
@@ -41,7 +52,7 @@ re-admitted. They are not end-to-end bind latency.
 With `RUST_LOG=strata::metrics=debug`, `thumbnail post-settle viewport painted`
 records `viewport_id`, `epoch`, `milestone` (`first` / `ninety_percent`), `total`,
 `ready`, and `elapsed_micros`. Icons/List start a fresh epoch at each scroll
-adjustment; elapsed time includes the 80 ms gate. A fixed cohort of visible
+adjustment; elapsed time includes the configured settle gate. A fixed cohort of visible
 thumbnail targets is captured at the first post-settle GTK after-paint callback;
 prefetch targets are excluded. Existing same-file textures count as ready. Failed,
 removed, or rebound cohort members cannot falsely satisfy the 90% threshold;
