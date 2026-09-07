@@ -148,7 +148,6 @@ fn metadata_updates_use_the_local_trash_thumbnail_source() {
                         path: path.to_owned(),
                         modified: None,
                         file_size: None,
-                        thumbnail_size: 64,
                     },
                     kind: thumbnail::ThumbnailKind::Image,
                     target: thumbnail::PendingTarget {

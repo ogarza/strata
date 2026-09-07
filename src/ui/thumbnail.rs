@@ -100,7 +100,6 @@ struct MetadataWaiter {
     kind: ThumbnailKind,
     target: PendingTarget,
     file_size: Option<u64>,
-    thumbnail_size: i32,
 }
 struct PersistJob {
     path: PathBuf,
@@ -207,7 +206,6 @@ struct ThumbnailKey {
     path: PathBuf,
     modified: Option<i64>,
     file_size: Option<u64>,
-    thumbnail_size: i32,
 }
 
 #[derive(Default)]
@@ -422,7 +420,6 @@ fn set_thumbnail_for_path(request: ThumbnailRequest<'_>) {
         path: path.clone(),
         modified: request.modified,
         file_size: request.file_size,
-        thumbnail_size,
     };
     match THUMBNAIL_CACHE.with(|cache| cache.borrow_mut().get(&key)) {
         Some(CacheHit::Ready(texture)) => {
@@ -742,7 +739,6 @@ fn push_metadata_waiter(group: usize, park: SettledPark) {
                 kind: park.kind,
                 target: park.target,
                 file_size: park.key.file_size,
-                thumbnail_size: park.key.thumbnail_size,
             });
         }
     });
@@ -785,7 +781,6 @@ pub(super) fn note_metadata(path: &Path, modified: Option<i64>, file_size: Optio
             path: path.to_path_buf(),
             modified,
             file_size: file_size.or(waiter.file_size),
-            thumbnail_size: waiter.thumbnail_size,
         };
         park_into_group(waiter.group, key, waiter.kind, waiter.target, false);
     }

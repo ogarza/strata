@@ -31,7 +31,6 @@ fn key(index: usize) -> ThumbnailKey {
         path: PathBuf::from(format!("image-{index}.png")),
         modified: Some(1),
         file_size: Some(1),
-        thumbnail_size: 64,
     }
 }
 
@@ -349,7 +348,6 @@ fn metadata_fill_updates_thumbnail_waiting_for_settle() {
                         path: path.clone(),
                         modified: None,
                         file_size: None,
-                        thumbnail_size: 64,
                     },
                     kind: ThumbnailKind::Image,
                     target: PendingTarget {
@@ -391,7 +389,6 @@ fn unavailable_metadata_releases_settled_thumbnail_work() {
                         path: path.clone(),
                         modified: None,
                         file_size: None,
-                        thumbnail_size: 64,
                     },
                     kind: ThumbnailKind::Image,
                     target: PendingTarget {
@@ -434,7 +431,6 @@ fn cancellation_removes_metadata_waiters() {
                     image: glib::WeakRef::new(),
                 },
                 file_size: None,
-                thumbnail_size: 64,
             }],
         );
     });
@@ -541,7 +537,6 @@ fn cache_hit_applies_texture_on_idle_not_during_bind() {
                         path: path.clone(),
                         modified: Some(1),
                         file_size: Some(1),
-                        thumbnail_size: 64,
                     },
                     texture.clone(),
                 );
