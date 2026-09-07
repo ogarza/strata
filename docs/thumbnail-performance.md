@@ -21,6 +21,14 @@ hit never acquires a render permit. A miss is promoted once to the existing
 one-shot sandbox renderer, retaining its deduplicated targets and render permit
 through decode. Persistence remains best effort.
 
+## D06a protocol and output transport proof
+
+D06a adds a GTK-free `sandbox::protocol` module for a future persistent thumbnail worker control plane. Production thumbnails and previews still use the existing one-shot sandbox routes; no persistent worker is spawned or routed in this diff.
+
+The protocol uses small fixed `SOCK_SEQPACKET` Unix control packets and sealed memfd output transport. It defines a readiness/version handshake, one active request per worker, parent worker generations, exact request/reply envelopes, bounded thumbnail output metadata, distinct job-failure versus protocol-contract failure handling, descriptor-count and ancillary-truncation validation, required memfd seals, regular-file and length checks, a 4 MiB thumbnail output cap, checked allocation bounds, `EINTR`/`EAGAIN`/peer-closure handling, and `MSG_NOSIGNAL` sends. Tests exercise sequential round trips, unsupported opcode recovery, malformed packets, version/ID/status/ordering errors, descriptor rejection and closure, ancillary truncation, invalid output metadata, missing seals, bad lengths, oversized outputs, peer closure, timeouts, high-entropy maximum-size output, and requested-edge metadata.
+
+D06a does not pass paths or URIs as job capabilities and does not decode untrusted user files outside bwrap. S1, S2, and S3 remain open: transport validation is not codec-safety proof, source-isolation approval, or approval to reuse persistent decoder state.
+
 ## D05 unified render budget
 
 Render misses now use a single four-slot scheduler. RAW, PDF, and video jobs are
