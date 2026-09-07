@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use std::{
+    os::fd::AsFd,
     path::{Path, PathBuf},
     process::Command,
+    thread,
     time::{Duration, Instant},
 };
 
@@ -11,9 +13,88 @@ use gdk_pixbuf::prelude::*;
 use super::{
     MediaBackend, bounded_output, bounded_output_with_timeout, bounded_surface_dimensions,
     media_backends, media_command, read_limited, render_pixbuf, render_raw, render_raw_thumbnail,
-    run, run_media_backends, scale_embedded_thumbnail,
+    run, run_media_backends, run_thumbnail_worker, scale_embedded_thumbnail,
 };
 use crate::sandbox::MediaPreviewBackend;
+
+fn solid_png(width: i32, height: i32) -> Vec<u8> {
+    let pixbuf = gdk_pixbuf::Pixbuf::new(gdk_pixbuf::Colorspace::Rgb, false, 8, width, height)
+        .expect("allocate pixbuf");
+    pixbuf.fill(0x3366_99ff);
+    pixbuf.save_to_bufferv("png", &[]).expect("encode png")
+}
+
+#[test]
+fn thumbnail_worker_decodes_two_sealed_snapshots_and_survives_decode_failure() {
+    let (parent, worker) = crate::sandbox::protocol::control_socketpair().expect("socketpair");
+    let worker_thread = thread::spawn(move || run_thumbnail_worker(worker.as_fd()));
+    crate::sandbox::protocol::expect_ready(parent.as_fd()).expect("ready");
+    let generation = crate::sandbox::protocol::WorkerGeneration::new(1).expect("generation");
+    let mut session = crate::sandbox::protocol::ParentSession::new(generation);
+
+    let bad = crate::sandbox::protocol::sealed_memfd("bad-input", b"not an image")
+        .expect("bad sealed input");
+    let request = session
+        .begin_request(
+            generation,
+            crate::sandbox::protocol::Operation::ThumbnailPng,
+            32,
+        )
+        .expect("begin bad request");
+    crate::sandbox::protocol::send_packet(
+        parent.as_fd(),
+        request,
+        &[bad.as_fd()],
+        Duration::from_secs(1),
+    )
+    .expect("send bad request");
+    let failure = session
+        .accept_reply(
+            crate::sandbox::protocol::recv_packet(parent.as_fd(), Duration::from_secs(1), 0)
+                .expect("failure reply"),
+        )
+        .expect("accept failure");
+    assert!(matches!(
+        failure,
+        crate::sandbox::protocol::JobReply::JobFailure(
+            crate::sandbox::protocol::Status::DecodeFailed
+        )
+    ));
+
+    for edge in [32, 16] {
+        let input = crate::sandbox::protocol::sealed_memfd("png-input", &solid_png(80, 60))
+            .expect("sealed png input");
+        let request = session
+            .begin_request(
+                generation,
+                crate::sandbox::protocol::Operation::ThumbnailPng,
+                edge,
+            )
+            .expect("begin request");
+        crate::sandbox::protocol::send_packet(
+            parent.as_fd(),
+            request,
+            &[input.as_fd()],
+            Duration::from_secs(1),
+        )
+        .expect("send request");
+        let reply = session
+            .accept_reply(
+                crate::sandbox::protocol::recv_packet(parent.as_fd(), Duration::from_secs(1), 1)
+                    .expect("success reply"),
+            )
+            .expect("accept success");
+        let crate::sandbox::protocol::JobReply::Success(output) = reply else {
+            panic!("expected success");
+        };
+        assert_eq!(output.metadata().width, edge);
+        assert_eq!(output.metadata().height, edge * 3 / 4);
+        assert!(!output.read_all().expect("png output").is_empty());
+    }
+
+    drop(parent);
+    assert!(worker_thread.join().expect("worker join").is_ok());
+}
 
 fn arguments(backend: &MediaBackend) -> String {
     media_command(backend, Path::new("/input"))

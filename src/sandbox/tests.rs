@@ -10,8 +10,9 @@ use std::{
 
 use super::{
     Cancellation, MAX_RASTER_INPUT_BYTES, MEDIA_WALL_TIME_LIMIT, MediaPreviewBackend,
-    ParseOperation, PrivateOutput, WALL_TIME_LIMIT, gpu_devices, parse, polaris_gpu_available_at,
-    resolve_renderer_executable, sandbox_command, sandbox_input_path, spawn_renderer, valid_output,
+    ParseOperation, PrivateOutput, WALL_TIME_LIMIT, gpu_devices, parse,
+    persistent_thumbnail_worker_command, polaris_gpu_available_at, resolve_renderer_executable,
+    sandbox_command, sandbox_input_path, sealed_raster_snapshot, spawn_renderer, valid_output,
     wait_for_renderer, wait_for_renderer_output,
 };
 
@@ -61,6 +62,53 @@ fn png(width: u32, height: u32) -> Vec<u8> {
     data.extend_from_slice(&width.to_be_bytes());
     data.extend_from_slice(&height.to_be_bytes());
     data
+}
+
+#[test]
+fn persistent_thumbnail_worker_has_no_source_or_output_binds() {
+    let command = persistent_thumbnail_worker_command(Path::new("/tmp/strata"));
+    let arguments: Vec<_> = command
+        .get_args()
+        .map(|argument| argument.to_string_lossy().into_owned())
+        .collect();
+    let joined = arguments.join(" ");
+
+    assert!(joined.contains("--unshare-all"));
+    assert!(joined.contains("--clearenv"));
+    assert!(joined.contains("--ro-bind /tmp/strata /app/strata"));
+    assert!(joined.contains("--as=2147483648"));
+    assert!(joined.contains("--fsize=536870912"));
+    assert!(joined.ends_with("/app/strata --thumbnail-worker"));
+    assert!(!joined.contains("--cpu=10"));
+    assert!(!joined.contains("/output"));
+    assert!(!joined.contains("/input"));
+    assert!(!joined.contains("--ro-bind /home /home"));
+    assert!(!joined.contains("--share-net"));
+}
+
+#[test]
+fn sealed_raster_snapshots_do_not_share_original_source_writes() {
+    let directory = PrivateOutput::create().expect("create temporary directory");
+    let input = directory.path().join("photo.png");
+    fs::write(&input, b"first").expect("write source");
+
+    let snapshot = sealed_raster_snapshot(&input).expect("snapshot source");
+    fs::write(&input, b"second").expect("modify original");
+
+    assert_eq!(
+        rustix::fs::fcntl_get_seals(&snapshot).expect("seals"),
+        rustix::fs::SealFlags::SEAL
+            .union(rustix::fs::SealFlags::SHRINK)
+            .union(rustix::fs::SealFlags::GROW)
+            .union(rustix::fs::SealFlags::WRITE)
+    );
+    let mut bytes = [0u8; 5];
+    assert_eq!(
+        rustix::io::pread(&snapshot, bytes.as_mut_slice(), 0).expect("read snapshot"),
+        5
+    );
+    assert_eq!(&bytes, b"first");
+    assert!(rustix::io::write(&snapshot, b"x").is_err());
 }
 
 #[test]

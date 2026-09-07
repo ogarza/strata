@@ -3,6 +3,7 @@
 use std::{
     fs,
     io::{self, Read},
+    os::fd::{AsFd, AsRawFd, BorrowedFd},
     path::{Path, PathBuf},
     process::{Child, Command, Output, Stdio},
     sync::mpsc,
@@ -27,6 +28,87 @@ enum MediaBackend {
     VaApi(PathBuf),
     Vulkan(usize),
     Software,
+}
+
+pub(crate) fn run_thumbnail_worker_stdio() -> Result<(), String> {
+    let stdin = std::io::stdin();
+    run_thumbnail_worker(stdin.as_fd())
+}
+
+pub(crate) fn run_thumbnail_worker(control: BorrowedFd<'_>) -> Result<(), String> {
+    crate::sandbox::protocol::send_packet(
+        control,
+        crate::sandbox::protocol::WireEnvelope::ready(),
+        &[],
+        crate::sandbox::protocol::STARTUP_DEADLINE,
+    )
+    .map_err(|error| format!("Unable to announce thumbnail worker readiness: {error:?}"))?;
+    loop {
+        let packet = match crate::sandbox::protocol::recv_packet(
+            control,
+            crate::sandbox::protocol::REQUEST_DEADLINE,
+            1,
+        ) {
+            Ok(packet) => packet,
+            Err(crate::sandbox::protocol::ProtocolError::PeerClosed) => return Ok(()),
+            Err(error) => return Err(format!("Invalid thumbnail worker request: {error:?}")),
+        };
+        let request = crate::sandbox::protocol::validate_snapshot_request(packet)
+            .map_err(|error| format!("Invalid thumbnail worker request: {error:?}"))?;
+        let input = request
+            .input
+            .as_ref()
+            .ok_or_else(|| "Thumbnail worker request omitted its input snapshot".to_owned())?;
+        let input_path = PathBuf::from(format!("/proc/self/fd/{}", input.as_raw_fd()));
+        let result = match request.operation {
+            crate::sandbox::protocol::Operation::ThumbnailPng => {
+                render_pixbuf(&input_path, i32::from(request.requested_edge))
+            }
+        };
+        match result {
+            Ok(png) => {
+                let dimensions = png_dimensions(&png)
+                    .ok_or_else(|| "Thumbnail worker produced invalid PNG".to_owned())?;
+                let output =
+                    crate::sandbox::protocol::sealed_memfd("strata-thumbnail-output", &png)
+                        .map_err(|error| {
+                            format!("Unable to seal thumbnail worker output: {error:?}")
+                        })?;
+                crate::sandbox::protocol::send_packet(
+                    control,
+                    crate::sandbox::protocol::WireEnvelope::reply(
+                        request.request_id,
+                        crate::sandbox::protocol::Status::Ok,
+                        crate::sandbox::protocol::Representation::Png,
+                        dimensions.0,
+                        dimensions.1,
+                        0,
+                        png.len() as u64,
+                    ),
+                    &[output.as_fd()],
+                    crate::sandbox::protocol::REQUEST_DEADLINE,
+                )
+                .map_err(|error| format!("Unable to send thumbnail worker reply: {error:?}"))?;
+            }
+            Err(_) => {
+                crate::sandbox::protocol::send_packet(
+                    control,
+                    crate::sandbox::protocol::WireEnvelope::reply(
+                        request.request_id,
+                        crate::sandbox::protocol::Status::DecodeFailed,
+                        crate::sandbox::protocol::Representation::Png,
+                        0,
+                        0,
+                        0,
+                        0,
+                    ),
+                    &[],
+                    crate::sandbox::protocol::REQUEST_DEADLINE,
+                )
+                .map_err(|error| format!("Unable to send thumbnail worker failure: {error:?}"))?;
+            }
+        }
+    }
 }
 
 pub(crate) fn run(arguments: &[String]) -> Result<(), String> {
@@ -60,6 +142,19 @@ pub(crate) fn run(arguments: &[String]) -> Result<(), String> {
             .map_err(|error| error.to_string())?;
     }
     Ok(())
+}
+
+fn png_dimensions(data: &[u8]) -> Option<(u16, u16)> {
+    if !data.starts_with(b"\x89PNG\r\n\x1a\n")
+        || data.get(8..12)? != 13u32.to_be_bytes()
+        || data.get(12..16)? != b"IHDR"
+    {
+        return None;
+    }
+    let width = u32::from_be_bytes(data.get(16..20)?.try_into().ok()?);
+    let height = u32::from_be_bytes(data.get(20..24)?.try_into().ok()?);
+    (width > 0 && height > 0)
+        .then(|| Some((u16::try_from(width).ok()?, u16::try_from(height).ok()?)))?
 }
 
 fn render_pixbuf(path: &Path, size: i32) -> Result<Vec<u8>, String> {

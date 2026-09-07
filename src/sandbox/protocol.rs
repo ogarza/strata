@@ -467,7 +467,18 @@ pub(crate) fn expect_ready(socket: BorrowedFd<'_>) -> ProtocolResult<()> {
 }
 
 pub(crate) fn validate_request(packet: Packet) -> ProtocolResult<WorkerRequest> {
-    if !packet.fds.is_empty() || packet.envelope.message_type != MessageType::Request {
+    validate_request_with_fds(packet, 0)
+}
+
+pub(crate) fn validate_snapshot_request(packet: Packet) -> ProtocolResult<WorkerRequest> {
+    validate_request_with_fds(packet, 1)
+}
+
+fn validate_request_with_fds(
+    mut packet: Packet,
+    expected_fds: usize,
+) -> ProtocolResult<WorkerRequest> {
+    if packet.envelope.message_type != MessageType::Request || packet.fds.len() != expected_fds {
         return Err(ProtocolError::UnexpectedDescriptors);
     }
     let operation =
@@ -484,18 +495,27 @@ pub(crate) fn validate_request(packet: Packet) -> ProtocolResult<WorkerRequest> 
     {
         return Err(ProtocolError::MalformedPacket);
     }
+    let input = if expected_fds == 1 {
+        Some(validate_input_snapshot_fd(
+            packet.fds.pop().expect("one snapshot fd"),
+        )?)
+    } else {
+        None
+    };
     Ok(WorkerRequest {
         request_id: packet.envelope.request_id,
         operation,
         requested_edge: packet.envelope.requested_edge,
+        input,
     })
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub(crate) struct WorkerRequest {
     pub(crate) request_id: u64,
     pub(crate) operation: Operation,
     pub(crate) requested_edge: u16,
+    pub(crate) input: Option<OwnedFd>,
 }
 
 pub(crate) fn unsupported_reply(request_id: u64) -> WireEnvelope {
@@ -568,20 +588,37 @@ fn validate_output_metadata(envelope: &WireEnvelope) -> ProtocolResult<OutputMet
 }
 
 fn validate_output_fd(fd: OwnedFd, metadata: OutputMetadata) -> ProtocolResult<ValidatedOutput> {
+    validate_sealed_regular_fd(&fd, metadata.output_len, THUMBNAIL_OUTPUT_CAP_BYTES)?;
+    Ok(ValidatedOutput { fd, metadata })
+}
+
+pub(crate) fn validate_input_snapshot_fd(fd: OwnedFd) -> ProtocolResult<OwnedFd> {
     let stat = fstat(&fd)?;
     if !FileType::from_raw_mode(stat.st_mode).is_file() {
         return Err(ProtocolError::WrongDescriptorType);
     }
-    if u64::try_from(stat.st_size).map_err(|_| ProtocolError::BadOutputLength)?
-        != metadata.output_len
-    {
+    let len = u64::try_from(stat.st_size).map_err(|_| ProtocolError::BadOutputLength)?;
+    validate_sealed_regular_fd(&fd, len, crate::sandbox::MAX_RASTER_INPUT_BYTES)?;
+    Ok(fd)
+}
+
+fn validate_sealed_regular_fd(fd: &OwnedFd, expected_len: u64, cap: u64) -> ProtocolResult<()> {
+    let stat = fstat(fd)?;
+    if !FileType::from_raw_mode(stat.st_mode).is_file() {
+        return Err(ProtocolError::WrongDescriptorType);
+    }
+    let len = u64::try_from(stat.st_size).map_err(|_| ProtocolError::BadOutputLength)?;
+    if len != expected_len {
         return Err(ProtocolError::BadOutputLength);
     }
-    let seals = fcntl_get_seals(&fd).map_err(|_| ProtocolError::MissingSeals)?;
+    if len > cap {
+        return Err(ProtocolError::OutputTooLarge);
+    }
+    let seals = fcntl_get_seals(fd).map_err(|_| ProtocolError::MissingSeals)?;
     if !seals.contains(REQUIRED_OUTPUT_SEALS) {
         return Err(ProtocolError::MissingSeals);
     }
-    Ok(ValidatedOutput { fd, metadata })
+    Ok(())
 }
 
 pub(crate) fn sealed_memfd(name: &str, bytes: &[u8]) -> ProtocolResult<OwnedFd> {

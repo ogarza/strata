@@ -37,7 +37,7 @@ External thumbnail providers have bounded stdout and discarded stderr. The paren
 
 ## Persistent thumbnail protocol proof
 
-The protocol module introduced for D06a defines, documents, and tests the future thumbnail worker control plane only. It does not start persistent helpers, grant source capabilities, decode helper output in production, or resolve the open S1/S2/S3 security decisions.
+The protocol module introduced for D06a defines, documents, and tests the future thumbnail worker control plane only. D06b adds a non-production persistent raster-worker proof using that protocol. Production thumbnail routing still does not start persistent helpers or use this protocol.
 
 Control packets are exactly 48 bytes on a `SOCK_SEQPACKET` Unix socketpair created with `CLOEXEC` and `NONBLOCK`. The parent should map the helper side through ordinary `Stdio::from(OwnedFd)` when a helper seam is added, rather than passing path or URI job capabilities or using broad unsafe fd-inheritance policy. The packet envelope contains:
 
@@ -52,4 +52,8 @@ Startup expects a readiness/version packet within the two-second startup deadlin
 
 Successful replies carry one sealed regular memfd, never a large inline PNG/raw frame. The parent validates ancillary truncation, descriptor count, `MSG_CMSG_CLOEXEC`, regular-file status, required seals (`SEAL`, `SHRINK`, `GROW`, and `WRITE`), `fstat` length, the 4 MiB thumbnail output cap, dimensions, representation, stride metadata, and checked allocation size before reading. Unexpected descriptors are owned and dropped on rejection paths. Send/receive paths handle `EINTR`, nonblocking `EAGAIN` as bounded wait failure, peer closure, and `MSG_NOSIGNAL` send behavior.
 
-These validations bound the transport contract only. They do not prove codec safety for PNG parsing, do not sandbox shared-cache decoding, do not protect original sources from a future persistent decoder, and do not approve persistent decoder state reuse.
+D06b's approved source-protection strategy is a sealed bounded raster snapshot memfd. The parent opens the source with `CLOEXEC` and `NONBLOCK`, verifies it is a regular file within the raster input cap, copies it into an anonymous memfd, detects size/mtime changes during the copy, and applies `SEAL`, `SHRINK`, `GROW`, and `WRITE` before the worker receives it. The persistent raster worker receives that sealed snapshot fd by `SCM_RIGHTS`; it does not receive a path, URI, original source fd, or writable output directory. The worker decodes through `/proc/self/fd/<snapshot-fd>`, replies with a sealed output memfd, and remains reusable after bounded decode failures.
+
+For D06b, persistent decoder process reuse after the sealed-input proof is accepted. This intentionally improves worker reuse but means decoder/library state can carry from one raster file to the next until the worker exits for protocol failure, crash, timeout, resource retirement, idle policy, or application shutdown. This is a documented blast-radius tradeoff, not per-file decoder-state isolation.
+
+S3 remains an accepted exposure for this scope: the parent still performs bounded PNG decoding for shared-cache entries and validated worker outputs. Header, dimension, byte, fd, and seal checks bound allocations and transport behavior, but they do not prove the PNG codec is safe or sandbox cache decoding. Raw replies or sandboxed cache decoding remain possible follow-up designs, not D06b behavior.

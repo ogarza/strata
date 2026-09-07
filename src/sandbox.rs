@@ -5,6 +5,7 @@ pub(crate) mod protocol;
 use std::{
     fs,
     io::{self, Read},
+    os::fd::OwnedFd,
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     sync::{
@@ -383,6 +384,178 @@ fn wait_for_renderer_output(
         }
         wait_step(pidfd.as_ref(), deadline);
     }
+}
+
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "D06b proves persistent workers before production thumbnail routing uses them"
+    )
+)]
+pub(crate) fn sealed_raster_snapshot(input: &Path) -> Result<OwnedFd, String> {
+    let input = input
+        .canonicalize()
+        .map_err(|error| format!("Unable to open preview input: {error}"))?;
+    let source = rustix::fs::open(
+        &input,
+        rustix::fs::OFlags::RDONLY
+            .union(rustix::fs::OFlags::CLOEXEC)
+            .union(rustix::fs::OFlags::NONBLOCK),
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(|error| format!("Unable to open preview input: {error}"))?;
+    let before = rustix::fs::fstat(&source)
+        .map_err(|error| format!("Unable to inspect preview input: {error}"))?;
+    if !rustix::fs::FileType::from_raw_mode(before.st_mode).is_file() {
+        return Err("Preview input is not a regular file".to_owned());
+    }
+    if before.st_size < 0 || before.st_size as u64 > MAX_RASTER_INPUT_BYTES {
+        return Err("Preview input exceeds the supported size limit".to_owned());
+    }
+    let snapshot = rustix::fs::memfd_create(
+        "strata-thumbnail-input",
+        rustix::fs::MemfdFlags::CLOEXEC.union(rustix::fs::MemfdFlags::ALLOW_SEALING),
+    )
+    .map_err(|error| format!("Unable to create preview input snapshot: {error}"))?;
+    copy_source_to_snapshot(&source, &snapshot)?;
+    let after = rustix::fs::fstat(&source)
+        .map_err(|error| format!("Unable to reinspect preview input: {error}"))?;
+    if before.st_size != after.st_size || before.st_mtime != after.st_mtime {
+        return Err("Preview input changed while it was being snapshotted".to_owned());
+    }
+    Ok(snapshot)
+}
+
+fn copy_source_to_snapshot(source: &OwnedFd, snapshot: &OwnedFd) -> Result<(), String> {
+    let mut copied = 0u64;
+    loop {
+        let mut buffer = [0u8; 64 * 1024];
+        let read = rustix::io::retry_on_intr(|| rustix::io::read(source, buffer.as_mut_slice()))
+            .map_err(|error| format!("Unable to read preview input snapshot: {error}"))?;
+        if read == 0 {
+            break;
+        }
+        copied = copied
+            .checked_add(read as u64)
+            .ok_or_else(|| "Preview input exceeds the supported size limit".to_owned())?;
+        if copied > MAX_RASTER_INPUT_BYTES {
+            return Err("Preview input exceeds the supported size limit".to_owned());
+        }
+        let mut written = 0;
+        while written < read {
+            let count =
+                rustix::io::retry_on_intr(|| rustix::io::write(snapshot, &buffer[written..read]))
+                    .map_err(|error| format!("Unable to write preview input snapshot: {error}"))?;
+            if count == 0 {
+                return Err("Unable to write preview input snapshot".to_owned());
+            }
+            written += count;
+        }
+    }
+    rustix::fs::ftruncate(snapshot, copied)
+        .map_err(|error| format!("Unable to seal preview input snapshot: {error}"))?;
+    rustix::fs::fcntl_add_seals(
+        snapshot,
+        rustix::fs::SealFlags::SEAL
+            .union(rustix::fs::SealFlags::SHRINK)
+            .union(rustix::fs::SealFlags::GROW)
+            .union(rustix::fs::SealFlags::WRITE),
+    )
+    .map_err(|error| format!("Unable to seal preview input snapshot: {error}"))?;
+    Ok(())
+}
+
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "D06b proves persistent workers before production thumbnail routing uses them"
+    )
+)]
+pub(crate) fn persistent_thumbnail_worker_command(executable: &Path) -> Command {
+    let mut command = Command::new("bwrap");
+    command.args([
+        "--unshare-all",
+        "--die-with-parent",
+        "--new-session",
+        "--clearenv",
+        "--setenv",
+        "PATH",
+        "/usr/bin",
+        "--setenv",
+        "HOME",
+        "/nonexistent",
+        "--setenv",
+        "XDG_CACHE_HOME",
+        "/tmp/cache",
+        "--proc",
+        "/proc",
+        "--dev",
+        "/dev",
+        "--size",
+        &TEMPORARY_STORAGE_LIMIT_BYTES.to_string(),
+        "--tmpfs",
+        "/tmp",
+        "--dir",
+        "/app",
+        "--dir",
+        "/etc",
+        "--ro-bind",
+        "/usr",
+        "/usr",
+        "--ro-bind-try",
+        "/lib",
+        "/lib",
+        "--ro-bind-try",
+        "/lib64",
+        "/lib64",
+        "--ro-bind-try",
+        "/etc/fonts",
+        "/etc/fonts",
+        "--ro-bind-try",
+        "/etc/ld.so.cache",
+        "/etc/ld.so.cache",
+        "--ro-bind-try",
+        "/etc/ImageMagick-7",
+        "/etc/ImageMagick-7",
+        "--ro-bind-try",
+        "/etc/ImageMagick-6",
+        "/etc/ImageMagick-6",
+        "--ro-bind",
+    ]);
+    command.arg(executable).arg("/app/strata");
+    command.args([
+        "--setenv",
+        "MALLOC_ARENA_MAX",
+        "1",
+        "--",
+        "/usr/bin/prlimit",
+        &format!("--as={ADDRESS_SPACE_LIMIT_BYTES}"),
+        &format!("--fsize={FILE_SIZE_LIMIT_BYTES}"),
+        "--",
+        "/app/strata",
+        "--thumbnail-worker",
+    ]);
+    command
+}
+
+#[expect(
+    dead_code,
+    reason = "D06b proves persistent workers before production thumbnail routing uses them"
+)]
+pub(crate) fn spawn_persistent_thumbnail_worker(
+    executable: &Path,
+) -> Result<(Child, OwnedFd), String> {
+    let (parent_socket, worker_socket) = protocol::control_socketpair()
+        .map_err(|error| format!("Unable to create thumbnail worker control socket: {error:?}"))?;
+    let mut command = persistent_thumbnail_worker_command(executable);
+    command.stdin(Stdio::from(worker_socket));
+    command.stdout(Stdio::null());
+    command.stderr(Stdio::null());
+    let child = spawn_renderer(&mut command)
+        .map_err(|error| format!("Unable to start the thumbnail worker sandbox: {error}"))?;
+    Ok((child, parent_socket))
 }
 
 fn sandbox_command(

@@ -41,6 +41,16 @@ fn main() -> gtk::glib::ExitCode {
     }
     if arguments
         .get(1)
+        .is_some_and(|value| value == "--thumbnail-worker")
+    {
+        if let Err(error) = sandbox_helper::run_thumbnail_worker_stdio() {
+            eprintln!("Thumbnail worker failed: {error}");
+            return gtk::glib::ExitCode::FAILURE;
+        }
+        return gtk::glib::ExitCode::SUCCESS;
+    }
+    if arguments
+        .get(1)
         .is_some_and(|value| value == GVFS_PROBE_ARGUMENT)
     {
         let _vfs = gio::Vfs::default();

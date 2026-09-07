@@ -27,7 +27,15 @@ D06a adds a GTK-free `sandbox::protocol` module for a future persistent thumbnai
 
 The protocol uses small fixed `SOCK_SEQPACKET` Unix control packets and sealed memfd output transport. It defines a readiness/version handshake, one active request per worker, parent worker generations, exact request/reply envelopes, bounded thumbnail output metadata, distinct job-failure versus protocol-contract failure handling, descriptor-count and ancillary-truncation validation, required memfd seals, regular-file and length checks, a 4 MiB thumbnail output cap, checked allocation bounds, `EINTR`/`EAGAIN`/peer-closure handling, and `MSG_NOSIGNAL` sends. Tests exercise sequential round trips, unsupported opcode recovery, malformed packets, version/ID/status/ordering errors, descriptor rejection and closure, ancillary truncation, invalid output metadata, missing seals, bad lengths, oversized outputs, peer closure, timeouts, high-entropy maximum-size output, and requested-edge metadata.
 
-D06a does not pass paths or URIs as job capabilities and does not decode untrusted user files outside bwrap. S1, S2, and S3 remain open: transport validation is not codec-safety proof, source-isolation approval, or approval to reuse persistent decoder state.
+D06a does not pass paths or URIs as job capabilities and does not decode untrusted user files outside bwrap. S1, S2, and S3 remained open until D06b authorization.
+
+## D06b sandboxed input-isolation and worker proof
+
+D06b records the approved security decisions for the persistent raster-worker proof: sealed bounded raster snapshot memfds for S1, accepted persistent decoder reuse after that sealed-input proof for S2, and documented parent-side bounded PNG decode exposure for S3. Production thumbnail routing remains one-shot; the worker proof is not the D07 production pool.
+
+The parent-side snapshot helper opens raster sources with `CLOEXEC` and `NONBLOCK`, rejects non-regular or oversized files, copies into an anonymous memfd, detects size/mtime changes during staging, and seals the snapshot against writes, growth, and shrink before it can be sent. The persistent worker command has no source path bind and no writable output bind. The helper entrypoint receives one sealed snapshot fd per request over the D06a protocol, decodes only through that fd, sends sealed output memfds, and remains reusable after bounded decode failures.
+
+The accepted S2 tradeoff means native decoder state can persist across raster files inside a worker. D06b documents that blast radius but does not implement per-file disposable decoder children. The accepted S3 scope keeps parent-side bounded PNG decoding for shared-cache entries and validated helper outputs; allocation and transport validation do not prove codec safety.
 
 ## D05 unified render budget
 
