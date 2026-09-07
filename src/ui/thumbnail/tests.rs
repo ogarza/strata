@@ -16,8 +16,8 @@ use super::{
     THUMBNAIL_QUEUE, ThumbnailCache, ThumbnailJob, ThumbnailKey, ThumbnailKind, ThumbnailQueue,
     ViewSettle, cancel_thumbnail, clear_thumbnail_runtime, finish_thumbnail_decode,
     finish_thumbnail_targets, fire_settled_thumbnails, has_pending_thumbnail,
-    hold_thumbnail_workers, refresh_all_customized_icons, resolve_source_key, schedule_or_defer,
-    set_thumbnail_or_icon, should_promote_invalid_cache, show_customized_icon,
+    hold_thumbnail_workers, is_heavy, refresh_all_customized_icons, resolve_source_key,
+    schedule_or_defer, set_thumbnail_or_icon, should_promote_invalid_cache, show_customized_icon,
     take_pending_targets, thumbnail_kind,
 };
 use crate::{
@@ -127,6 +127,24 @@ fn thumbnail_cache_evicts_by_accounted_stride_bytes() {
     assert!(cache.get(&key(0)).is_none());
     assert!(matches!(cache.get(&key(1)), Some(CacheHit::Ready(_))));
     assert!(cache.byte_count <= MAX_CACHE_BYTES);
+}
+
+#[test]
+fn render_queue_limits_heavy_work_and_fairly_admits_raster_work() {
+    let mut queue = ThumbnailQueue::default();
+    queue.enqueue_kind(key(0), ThumbnailKind::Video);
+    queue.enqueue_kind(key(1), ThumbnailKind::Image);
+    queue.enqueue_kind(key(2), ThumbnailKind::Image);
+    queue.enqueue_kind(key(3), ThumbnailKind::Image);
+    assert!(is_heavy(ThumbnailKind::Video));
+    assert_eq!(queue.begin_next(), Some(key(1)));
+    queue.finish_key(&key(1));
+    assert_eq!(queue.begin_next(), Some(key(2)));
+    queue.finish_key(&key(2));
+    assert_eq!(queue.begin_next(), Some(key(3)));
+    queue.finish_key(&key(3));
+    assert_eq!(queue.begin_next(), Some(key(0)));
+    queue.finish_key(&key(0));
 }
 
 #[test]

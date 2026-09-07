@@ -21,6 +21,21 @@ hit never acquires a render permit. A miss is promoted once to the existing
 one-shot sandbox renderer, retaining its deduplicated targets and render permit
 through decode. Persistence remains best effort.
 
+## D05 unified render budget
+
+Render misses now use a single four-slot scheduler. RAW, PDF, and video jobs are
+classified as heavy and are limited to one active heavy job within those four
+slots. Raster work is admitted in a bounded burst of three before an eligible
+heavy job, preventing sustained image traffic from starving heavy providers.
+Lookup remains independent of this render budget.
+
+Queued jobs retain their provider kind through admission, execution, cancellation,
+and retry. Render permits are released by the completed source key, so completion
+order cannot release another job's permit. A cancelled consumer is detached while
+pending work is removed; stale completions remain rejected. This is still the
+one-shot renderer path: persistent workers, watchdogs, and provider-specific
+resource supervision are not part of D05.
+
 ## D04 resolved source identity
 
 Thumbnail lookup now resolves local regular-file size and modification time on

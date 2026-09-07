@@ -33,6 +33,8 @@ const THUMBNAIL_SETTLE_DELAY: Duration = Duration::from_millis(120);
 const MAX_SETTLE_WAIT: Duration = Duration::from_millis(400);
 #[cfg(test)]
 const VIEWPORT_OVERSCAN: f32 = 0.25;
+const MAX_HEAVY_THUMBNAILS: usize = 1;
+const MAX_RASTER_BURST: usize = 3;
 
 thread_local! {
     static ACTIVE_REQUESTS: RefCell<HashMap<usize, ActiveRequest>> =
@@ -303,15 +305,23 @@ impl CachedThumbnail {
 #[derive(Default)]
 struct ThumbnailQueue {
     running: usize,
-    queued: VecDeque<ThumbnailKey>,
+    heavy_running: usize,
+    raster_burst: usize,
+    queued: VecDeque<(ThumbnailKey, ThumbnailKind)>,
+    active_kinds: HashMap<ThumbnailKey, ThumbnailKind>,
 }
 
 impl ThumbnailQueue {
+    #[cfg(test)]
     fn enqueue(&mut self, key: ThumbnailKey) -> bool {
+        self.enqueue_kind(key, ThumbnailKind::Image)
+    }
+
+    fn enqueue_kind(&mut self, key: ThumbnailKey, kind: ThumbnailKind) -> bool {
         if self.queued.len() >= MAX_QUEUED_THUMBNAILS {
             return false;
         }
-        self.queued.push_back(key);
+        self.queued.push_back((key, kind));
         true
     }
 
@@ -319,21 +329,48 @@ impl ThumbnailQueue {
         if self.running >= MAX_THUMBNAIL_WORKERS {
             return None;
         }
-        let key = self.queued.pop_front()?;
+        let heavy = self.queued.iter().position(|(_, kind)| is_heavy(*kind));
+        let raster = self.queued.iter().position(|(_, kind)| !is_heavy(*kind));
+        let index = if let Some(heavy) = heavy
+            .filter(|_| self.heavy_running < MAX_HEAVY_THUMBNAILS)
+            .filter(|_| raster.is_none() || self.raster_burst >= MAX_RASTER_BURST)
+        {
+            heavy
+        } else {
+            raster.or(heavy)?
+        };
+        let (key, kind) = self.queued.remove(index)?;
         self.running += 1;
+        if is_heavy(kind) {
+            self.heavy_running += 1;
+            self.raster_burst = 0;
+        } else {
+            self.raster_burst += 1;
+        }
+        self.active_kinds.insert(key.clone(), kind);
         Some(key)
     }
 
-    fn push_front(&mut self, key: ThumbnailKey) {
-        self.queued.push_front(key);
+    fn push_front_kind(&mut self, key: ThumbnailKey, kind: ThumbnailKind) {
+        self.queued.push_front((key, kind));
     }
 
+    #[cfg(test)]
     fn finish(&mut self) {
         self.running = self.running.saturating_sub(1);
     }
 
+    fn finish_key(&mut self, key: &ThumbnailKey) {
+        if let Some(kind) = self.active_kinds.remove(key)
+            && is_heavy(kind)
+        {
+            self.heavy_running = self.heavy_running.saturating_sub(1);
+        }
+        self.running = self.running.saturating_sub(1);
+    }
+
     fn cancel(&mut self, key: &ThumbnailKey) {
-        self.queued.retain(|queued| queued != key);
+        self.queued.retain(|(queued, _)| queued != key);
     }
 }
 
@@ -800,10 +837,11 @@ fn start_render_jobs() {
                 cancellation: pending.cancellation.clone(),
             })
         }) else {
-            finish_thumbnail_slot();
+            THUMBNAIL_QUEUE.with(|queue| queue.borrow_mut().finish_key(&key));
             continue;
         };
         crate::metrics::mark_thumbnail_started();
+        let render_kind = job.kind;
         let render_job = job.clone();
         if decode::submit_owned(
             move || {
@@ -824,8 +862,9 @@ fn start_render_jobs() {
         )
         .is_err()
         {
-            THUMBNAIL_QUEUE.with(|queue| queue.borrow_mut().push_front(key));
-            finish_thumbnail_slot();
+            THUMBNAIL_QUEUE
+                .with(|queue| queue.borrow_mut().push_front_kind(key.clone(), render_kind));
+            THUMBNAIL_QUEUE.with(|queue| queue.borrow_mut().finish_key(&key));
             break;
         }
     }
@@ -905,7 +944,7 @@ fn finish_thumbnail_lookup(mut job: ThumbnailJob, result: LookupResult) {
         return;
     }
     crate::metrics::mark_thumbnail_lookup_miss();
-    if THUMBNAIL_QUEUE.with(|queue| queue.borrow_mut().enqueue(job.key.clone())) {
+    if THUMBNAIL_QUEUE.with(|queue| queue.borrow_mut().enqueue_kind(job.key.clone(), job.kind)) {
         start_render_jobs();
     } else {
         finish_thumbnail_failure(job, false);
@@ -939,7 +978,7 @@ fn finish_thumbnail_decode(
         Ok(decoded) => {
             let targets = take_pending_targets(&job.key, job.id);
             if rendered {
-                finish_thumbnail_slot();
+                finish_thumbnail_slot(&job.key);
             }
             if let Some(targets) = targets {
                 crate::metrics::mark_thumbnail_completed();
@@ -971,7 +1010,7 @@ fn finish_thumbnail_decode(
 }
 
 fn finish_thumbnail_render_again(job: ThumbnailJob) {
-    if THUMBNAIL_QUEUE.with(|queue| queue.borrow_mut().enqueue(job.key.clone())) {
+    if THUMBNAIL_QUEUE.with(|queue| queue.borrow_mut().enqueue_kind(job.key.clone(), job.kind)) {
         start_render_jobs();
     } else {
         finish_thumbnail_failure(job, false);
@@ -994,7 +1033,7 @@ fn pending_thumbnail_matches(key: &ThumbnailKey, job_id: u64) -> bool {
 fn finish_thumbnail_failure(job: ThumbnailJob, render_admitted: bool) {
     let targets = take_pending_targets(&job.key, job.id);
     if render_admitted {
-        finish_thumbnail_slot();
+        finish_thumbnail_slot(&job.key);
     }
     if let Some(targets) = targets {
         crate::metrics::mark_thumbnail_cancelled();
@@ -1004,8 +1043,8 @@ fn finish_thumbnail_failure(job: ThumbnailJob, render_admitted: bool) {
     settle_thumbnail_pipeline();
 }
 
-fn finish_thumbnail_slot() {
-    THUMBNAIL_QUEUE.with(|queue| queue.borrow_mut().finish());
+fn finish_thumbnail_slot(key: &ThumbnailKey) {
+    THUMBNAIL_QUEUE.with(|queue| queue.borrow_mut().finish_key(key));
 }
 
 fn settle_thumbnail_pipeline() {
@@ -1413,6 +1452,13 @@ fn cancel_thumbnail(image_id: usize) {
         }
     });
     retry_deferred_thumbnails();
+}
+
+fn is_heavy(kind: ThumbnailKind) -> bool {
+    matches!(
+        kind,
+        ThumbnailKind::RawImage | ThumbnailKind::Pdf | ThumbnailKind::Video
+    )
 }
 
 fn thumbnail_kind(path: &Path) -> Option<ThumbnailKind> {
