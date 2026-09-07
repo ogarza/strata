@@ -1461,8 +1461,12 @@ fn is_heavy(kind: ThumbnailKind) -> bool {
     )
 }
 
-fn uses_persistent_raster_pool(kind: ThumbnailKind) -> bool {
-    kind == ThumbnailKind::Image
+fn persistent_pool_operation(kind: ThumbnailKind) -> Option<crate::sandbox::protocol::Operation> {
+    match kind {
+        ThumbnailKind::Image => Some(crate::sandbox::protocol::Operation::ThumbnailPng),
+        ThumbnailKind::Pdf => Some(crate::sandbox::protocol::Operation::ThumbnailPdf),
+        ThumbnailKind::RawImage | ThumbnailKind::Video => None,
+    }
 }
 
 fn thumbnail_kind(path: &Path) -> Option<ThumbnailKind> {
@@ -1488,17 +1492,19 @@ fn render_thumbnail(
     size: i32,
     cancellation: &Cancellation,
 ) -> Result<Vec<u8>, String> {
-    if uses_persistent_raster_pool(kind) {
+    if let Some(operation) = persistent_pool_operation(kind) {
         return crate::sandbox::render_persistent_thumbnail(
             path,
+            operation,
             size.clamp(16, 256),
             cancellation,
         );
     }
     let operation = match kind {
-        ThumbnailKind::Image => unreachable!("image thumbnails use the persistent raster pool"),
+        ThumbnailKind::Image | ThumbnailKind::Pdf => {
+            unreachable!("raster and PDF thumbnails use the persistent pool")
+        }
         ThumbnailKind::RawImage => ParseOperation::ThumbnailRaw,
-        ThumbnailKind::Pdf => ParseOperation::ThumbnailPdf,
         ThumbnailKind::Video => ParseOperation::ThumbnailVideo,
     };
     crate::sandbox::retire_idle_thumbnail_worker_for_oneshot();

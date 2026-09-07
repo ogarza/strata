@@ -64,6 +64,9 @@ pub(crate) fn run_thumbnail_worker(control: BorrowedFd<'_>) -> Result<(), String
             crate::sandbox::protocol::Operation::ThumbnailPng => {
                 render_pixbuf(&input_path, i32::from(request.requested_edge))
             }
+            crate::sandbox::protocol::Operation::ThumbnailPdf => {
+                render_pdf_thumbnail(&input_path, i32::from(request.requested_edge))
+            }
         };
         match result {
             Ok(png) => {

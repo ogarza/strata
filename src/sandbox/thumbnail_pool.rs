@@ -47,6 +47,7 @@ enum WorkerCommand {
 
 struct RenderRequest {
     snapshot: OwnedFd,
+    operation: protocol::Operation,
     requested_edge: u16,
     cancellation: Cancellation,
     reply: mpsc::Sender<RenderResult>,
@@ -63,6 +64,7 @@ struct WorkerReady {
 
 pub(crate) fn render_persistent_thumbnail(
     path: &Path,
+    operation: protocol::Operation,
     requested_edge: i32,
     cancellation: &Cancellation,
 ) -> Result<Vec<u8>, String> {
@@ -79,6 +81,7 @@ pub(crate) fn render_persistent_thumbnail(
     let (reply, result) = mpsc::channel();
     let request = RenderRequest {
         snapshot,
+        operation,
         requested_edge,
         cancellation: cancellation.clone(),
         reply,
@@ -271,6 +274,7 @@ fn worker_thread(
             Ok(WorkerCommand::Render(request)) => {
                 let result = runtime.render(
                     request.snapshot,
+                    request.operation,
                     request.requested_edge,
                     &request.cancellation,
                 );
@@ -328,6 +332,7 @@ impl WorkerRuntime {
     fn render(
         &mut self,
         snapshot: OwnedFd,
+        operation: protocol::Operation,
         requested_edge: u16,
         cancellation: &Cancellation,
     ) -> RenderResult {
@@ -337,11 +342,10 @@ impl WorkerRuntime {
                 reusable: true,
             };
         }
-        let request = match self.session.begin_request(
-            self.generation,
-            protocol::Operation::ThumbnailPng,
-            requested_edge,
-        ) {
+        let request = match self
+            .session
+            .begin_request(self.generation, operation, requested_edge)
+        {
             Ok(request) => request,
             Err(error) => {
                 return RenderResult {

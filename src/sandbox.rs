@@ -69,6 +69,10 @@ pub(crate) enum ParseOperation {
     )]
     ThumbnailImage,
     ThumbnailRaw,
+    #[expect(
+        dead_code,
+        reason = "D08 routes production PDF thumbnails through the persistent pool"
+    )]
     ThumbnailPdf,
     ThumbnailVideo,
     PreviewImage,
@@ -550,10 +554,11 @@ pub(crate) fn spawn_persistent_thumbnail_worker(
 
 pub(crate) fn render_persistent_thumbnail(
     input: &Path,
+    operation: protocol::Operation,
     value: i32,
     cancellation: &Cancellation,
 ) -> Result<Vec<u8>, String> {
-    thumbnail_pool::render_persistent_thumbnail(input, value, cancellation)
+    thumbnail_pool::render_persistent_thumbnail(input, operation, value, cancellation)
 }
 
 pub(crate) fn retire_idle_thumbnail_worker_for_oneshot() {

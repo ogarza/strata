@@ -78,6 +78,25 @@ fn round_trips_and_multiple_sequential_requests() {
 }
 
 #[test]
+fn pdf_thumbnail_operation_is_a_valid_bounded_request() {
+    let (parent, worker) = control_socketpair().expect("socketpair");
+    let generation = WorkerGeneration::new(3).expect("generation");
+    let mut session = ParentSession::new(generation);
+    let request = session
+        .begin_request(generation, Operation::ThumbnailPdf, 128)
+        .expect("begin pdf request");
+    send_packet(parent.as_fd(), request, &[], TEST_DEADLINE).expect("send pdf request");
+
+    let request = validate_request(
+        recv_packet(worker.as_fd(), TEST_DEADLINE, 0).expect("pdf request packet"),
+    )
+    .expect("pdf request");
+
+    assert_eq!(request.operation, Operation::ThumbnailPdf);
+    assert_eq!(request.requested_edge, 128);
+}
+
+#[test]
 fn unknown_opcode_is_job_failure_and_loop_accepts_next_request() {
     let (parent, worker) = control_socketpair().expect("socketpair");
     let worker_thread = thread::spawn(move || {

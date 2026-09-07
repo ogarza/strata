@@ -47,12 +47,14 @@ pub(crate) enum MessageType {
 #[repr(u16)]
 pub(crate) enum Operation {
     ThumbnailPng = 1,
+    ThumbnailPdf = 2,
 }
 
 impl Operation {
     fn from_wire(value: u16) -> Option<Self> {
         match value {
             1 => Some(Self::ThumbnailPng),
+            2 => Some(Self::ThumbnailPdf),
             _ => None,
         }
     }

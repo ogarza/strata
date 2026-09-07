@@ -16,9 +16,9 @@ use super::{
     THUMBNAIL_QUEUE, ThumbnailCache, ThumbnailJob, ThumbnailKey, ThumbnailKind, ThumbnailQueue,
     ViewSettle, cancel_thumbnail, clear_thumbnail_runtime, finish_thumbnail_decode,
     finish_thumbnail_targets, fire_settled_thumbnails, has_pending_thumbnail,
-    hold_thumbnail_workers, is_heavy, refresh_all_customized_icons, resolve_source_key,
-    schedule_or_defer, set_thumbnail_or_icon, should_promote_invalid_cache, show_customized_icon,
-    take_pending_targets, thumbnail_kind, uses_persistent_raster_pool,
+    hold_thumbnail_workers, is_heavy, persistent_pool_operation, refresh_all_customized_icons,
+    resolve_source_key, schedule_or_defer, set_thumbnail_or_icon, should_promote_invalid_cache,
+    show_customized_icon, take_pending_targets, thumbnail_kind,
 };
 use crate::{
     model::{EntryKind, FileEntry, Location, MetadataValue},
@@ -35,11 +35,17 @@ fn key(index: usize) -> ThumbnailKey {
 }
 
 #[test]
-fn production_pool_routes_only_mainstream_images_in_d07() {
-    assert!(uses_persistent_raster_pool(ThumbnailKind::Image));
-    assert!(!uses_persistent_raster_pool(ThumbnailKind::RawImage));
-    assert!(!uses_persistent_raster_pool(ThumbnailKind::Pdf));
-    assert!(!uses_persistent_raster_pool(ThumbnailKind::Video));
+fn production_pool_routes_raster_and_pdf_but_not_raw_or_video() {
+    assert_eq!(
+        persistent_pool_operation(ThumbnailKind::Image),
+        Some(crate::sandbox::protocol::Operation::ThumbnailPng)
+    );
+    assert_eq!(
+        persistent_pool_operation(ThumbnailKind::Pdf),
+        Some(crate::sandbox::protocol::Operation::ThumbnailPdf)
+    );
+    assert_eq!(persistent_pool_operation(ThumbnailKind::RawImage), None);
+    assert_eq!(persistent_pool_operation(ThumbnailKind::Video), None);
 }
 
 #[test]
