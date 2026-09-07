@@ -7,10 +7,11 @@
 //! known mtimes touch the disk, since there is nothing to validate against
 //! otherwise.
 //!
-//! Cache bytes are untrusted: opened without following symlinks,
-//! size- and dimension-bounded before allocation, and never decoded outside
-//! the sandbox loader path. Entries are normalized to the canonical `large`
-//! size class so small views cannot poison the shared bucket.
+//! Cache bytes are untrusted: they are opened without following symlinks and
+//! size- and dimension-bounded before the parent decodes them. This bounds work
+//! but does not sandbox the cache codec; that trust-boundary decision remains
+//! open in issue #516. Entries are normalized to the canonical `large` size
+//! class so small views cannot poison the shared bucket.
 
 #[cfg(test)]
 mod tests;

@@ -10,15 +10,16 @@ use std::{
 use gtk::{gdk, glib};
 
 use super::{
-    ACTIVE_REQUESTS, ActiveRequest, CacheHit, CachedThumbnail, MAX_CACHE_ENTRIES,
+    ACTIVE_REQUESTS, ActiveRequest, CacheHit, CachedThumbnail, MAX_CACHE_BYTES, MAX_CACHE_ENTRIES,
     MAX_PERSIST_QUEUE, MAX_QUEUED_THUMBNAILS, MAX_THUMBNAIL_WORKERS, METADATA_WAITERS,
     MetadataWaiter, PENDING_THUMBNAILS, PendingTarget, PendingThumbnail, PersistJob, PersistQueue,
-    SETTLE_VIEWS, SettledPark, THUMBNAIL_CACHE, THUMBNAIL_QUEUE, ThumbnailCache, ThumbnailKey,
-    ThumbnailKind, ThumbnailQueue, ViewSettle, cancel_thumbnail, clear_thumbnail_runtime,
-    finish_thumbnail_targets, fire_settled_thumbnails, has_pending_thumbnail,
-    hold_thumbnail_workers, note_metadata, refresh_all_customized_icons, retry_deferred_thumbnail,
-    schedule_or_defer, set_thumbnail_or_icon, show_customized_icon, take_pending_targets,
-    thumbnail_kind,
+    SETTLE_VIEWS, SettledPark, THUMBNAIL_CACHE, THUMBNAIL_QUEUE, ThumbnailCache, ThumbnailJob,
+    ThumbnailKey, ThumbnailKind, ThumbnailQueue, ViewSettle, cancel_thumbnail,
+    clear_thumbnail_runtime, finish_thumbnail_decode, finish_thumbnail_targets,
+    fire_settled_thumbnails, has_pending_thumbnail, hold_thumbnail_workers, note_metadata,
+    refresh_all_customized_icons, retry_deferred_thumbnail, schedule_or_defer,
+    set_thumbnail_or_icon, should_promote_invalid_cache, show_customized_icon,
+    take_pending_targets, thumbnail_kind,
 };
 use crate::{
     model::{EntryKind, FileEntry, Location, MetadataValue},
@@ -66,27 +67,30 @@ fn recognizes_mainstream_image_and_video_formats() {
     );
 }
 
+// 1×1 transparent PNG.
+const SAMPLE_PNG: &[u8] = &[
+    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4,
+    0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00, 0x01, 0x00, 0x00,
+    0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE,
+    0x42, 0x60, 0x82,
+];
+
 fn sample_texture() -> gdk::Texture {
-    // 1×1 transparent PNG.
-    const PNG: &[u8] = &[
-        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
-        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F,
-        0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00,
-        0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49,
-        0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
-    ];
-    gdk::Texture::from_bytes(&glib::Bytes::from_static(PNG)).expect("1x1 PNG texture")
+    gdk::Texture::from_bytes(&glib::Bytes::from_static(SAMPLE_PNG)).expect("1x1 PNG texture")
 }
 
 #[test]
 fn thumbnail_cache_evicts_the_least_recent_entry() {
     let mut cache = ThumbnailCache::default();
-    for index in 0..=MAX_CACHE_ENTRIES {
-        cache.insert(key(index), sample_texture());
+    for index in 0..MAX_CACHE_ENTRIES {
+        cache.insert(key(index), sample_texture(), 4);
     }
+    assert!(matches!(cache.get(&key(0)), Some(CacheHit::Ready(_))));
+    cache.insert(key(MAX_CACHE_ENTRIES), sample_texture(), 4);
 
-    let oldest = key(0);
-    assert!(cache.get(&oldest).is_none());
+    assert!(cache.get(&key(1)).is_none());
+    assert!(matches!(cache.get(&key(0)), Some(CacheHit::Ready(_))));
     assert_eq!(cache.entries.len(), MAX_CACHE_ENTRIES);
 }
 
@@ -94,11 +98,22 @@ fn thumbnail_cache_evicts_the_least_recent_entry() {
 fn thumbnail_cache_hits_reuse_the_decoded_texture() {
     let texture = sample_texture();
     let mut cache = ThumbnailCache::default();
-    cache.insert(key(0), texture.clone());
+    cache.insert(key(0), texture.clone(), 4);
     match cache.get(&key(0)) {
-        Some(CacheHit::Ready(hit)) => assert_eq!(hit, texture),
+        Some(CacheHit::Ready(hit)) => assert_eq!(hit.texture, texture),
         _ => panic!("expected a cached texture"),
     }
+}
+
+#[test]
+fn thumbnail_cache_evicts_by_accounted_stride_bytes() {
+    let mut cache = ThumbnailCache::default();
+    cache.insert(key(0), sample_texture(), MAX_CACHE_BYTES / 2 + 1);
+    cache.insert(key(1), sample_texture(), MAX_CACHE_BYTES / 2 + 1);
+
+    assert!(cache.get(&key(0)).is_none());
+    assert!(matches!(cache.get(&key(1)), Some(CacheHit::Ready(_))));
+    assert!(cache.byte_count <= MAX_CACHE_BYTES);
 }
 
 #[test]
@@ -515,18 +530,31 @@ fn drain_main_loop() {
     }
 }
 
+fn wait_until(mut condition: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !condition() {
+        assert!(Instant::now() < deadline, "thumbnail completion timed out");
+        glib::MainContext::default().iteration(false);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
 fn displayed_texture(image: &super::ThumbnailSlot) -> Option<gdk::Texture> {
     image.texture()
 }
 
+fn bind_thumbnail_at(image: &super::ThumbnailSlot, entry: &FileEntry, size: i32) {
+    set_thumbnail_or_icon(image, entry, crate::assets::icons::PICTURES, size, size);
+}
+
 fn bind_thumbnail(image: &super::ThumbnailSlot, entry: &FileEntry) {
-    set_thumbnail_or_icon(image, entry, crate::assets::icons::PICTURES, 64, 64);
+    bind_thumbnail_at(image, entry, 64);
 }
 
 #[test]
-fn cache_hit_applies_texture_on_idle_not_during_bind() {
+fn ready_texture_is_reused_across_display_sizes() {
     gtk_test(
-        "ui::thumbnail::tests::cache_hit_applies_texture_on_idle_not_during_bind",
+        "ui::thumbnail::tests::ready_texture_is_reused_across_display_sizes",
         || {
             super::super::theme::ThemeManager::shared();
             let path = PathBuf::from("/fixture/cache-hit.png");
@@ -539,11 +567,159 @@ fn cache_hit_applies_texture_on_idle_not_during_bind() {
                         file_size: Some(1),
                     },
                     texture.clone(),
+                    4,
                 );
             });
+            let small = super::ThumbnailSlot::new(64);
+            let large = super::ThumbnailSlot::new(128);
+            let entry = sample_entry(&path);
+            bind_thumbnail_at(&small, &entry, 64);
+            bind_thumbnail_at(&large, &entry, 128);
+            assert_eq!(displayed_texture(&small).as_ref(), Some(&texture));
+            assert_eq!(displayed_texture(&large).as_ref(), Some(&texture));
+            assert_eq!(small.slot_size(), 64);
+            assert_eq!(large.slot_size(), 128);
+            THUMBNAIL_CACHE.with(|cache| assert_eq!(cache.borrow().entries.len(), 1));
+            clear_thumbnail_runtime();
+        },
+    );
+}
+
+#[test]
+fn one_decode_completion_is_shared_by_multiple_targets() {
+    gtk_test(
+        "ui::thumbnail::tests::one_decode_completion_is_shared_by_multiple_targets",
+        || {
+            let path = PathBuf::from("/fixture/shared-decode.png");
+            let key = ThumbnailKey {
+                path: path.clone(),
+                modified: Some(1),
+                file_size: Some(1),
+            };
+            let first = super::ThumbnailSlot::new(64);
+            let second = super::ThumbnailSlot::new(128);
+            let mut targets = Vec::new();
+            for (request, image) in [(1, &first), (2, &second)] {
+                let image_id = image.as_ptr() as usize;
+                let weak = glib::WeakRef::new();
+                weak.set(Some(image));
+                ACTIVE_REQUESTS.with(|requests| {
+                    requests.borrow_mut().insert(
+                        image_id,
+                        ActiveRequest {
+                            id: request,
+                            image: weak.clone(),
+                            deferred: None,
+                        },
+                    );
+                });
+                targets.push(PendingTarget {
+                    image_id,
+                    request,
+                    image: weak,
+                });
+            }
+            let cancellation = crate::sandbox::Cancellation::default();
+            PENDING_THUMBNAILS.with(|pending| {
+                pending.borrow_mut().insert(
+                    key.clone(),
+                    PendingThumbnail {
+                        id: 10,
+                        kind: ThumbnailKind::Image,
+                        cancellation: cancellation.clone(),
+                        targets,
+                    },
+                );
+            });
+            THUMBNAIL_QUEUE.with(|queue| queue.borrow_mut().running = 1);
+            let job = ThumbnailJob {
+                id: 10,
+                key: key.clone(),
+                kind: ThumbnailKind::Image,
+                cancellation,
+            };
+            super::decode::submit(SAMPLE_PNG.to_vec(), move |decoded| {
+                finish_thumbnail_decode(job, SAMPLE_PNG.to_vec(), false, decoded);
+            })
+            .expect("shared completion decode should be admitted");
+
+            wait_until(|| first.texture().is_some() && second.texture().is_some());
+            assert_eq!(first.texture(), second.texture());
+            THUMBNAIL_CACHE.with(|cache| {
+                assert!(matches!(
+                    cache.borrow_mut().get(&key),
+                    Some(CacheHit::Ready(_))
+                ));
+            });
+            clear_thumbnail_runtime();
+        },
+    );
+}
+
+#[test]
+fn invalid_disk_decode_promotes_to_render_only_for_a_live_request() {
+    assert!(should_promote_invalid_cache(false, true));
+    assert!(!should_promote_invalid_cache(false, false));
+    assert!(!should_promote_invalid_cache(true, true));
+}
+
+#[test]
+fn cancellation_during_decode_completion_does_not_cache_or_apply() {
+    gtk_test(
+        "ui::thumbnail::tests::cancellation_during_decode_completion_does_not_cache_or_apply",
+        || {
+            let path = PathBuf::from("/fixture/cancel-decode.png");
+            let key = ThumbnailKey {
+                path: path.clone(),
+                modified: Some(1),
+                file_size: Some(1),
+            };
             let image = super::ThumbnailSlot::new(64);
-            bind_thumbnail(&image, &sample_entry(&path));
-            assert_eq!(displayed_texture(&image).as_ref(), Some(&texture));
+            let image_id = image.as_ptr() as usize;
+            let weak = glib::WeakRef::new();
+            weak.set(Some(&image));
+            ACTIVE_REQUESTS.with(|requests| {
+                requests.borrow_mut().insert(
+                    image_id,
+                    ActiveRequest {
+                        id: 3,
+                        image: weak.clone(),
+                        deferred: None,
+                    },
+                );
+            });
+            let cancellation = crate::sandbox::Cancellation::default();
+            PENDING_THUMBNAILS.with(|pending| {
+                pending.borrow_mut().insert(
+                    key.clone(),
+                    PendingThumbnail {
+                        id: 11,
+                        kind: ThumbnailKind::Image,
+                        cancellation: cancellation.clone(),
+                        targets: vec![PendingTarget {
+                            image_id,
+                            request: 3,
+                            image: weak,
+                        }],
+                    },
+                );
+            });
+            THUMBNAIL_QUEUE.with(|queue| queue.borrow_mut().running = 1);
+            let job = ThumbnailJob {
+                id: 11,
+                key: key.clone(),
+                kind: ThumbnailKind::Image,
+                cancellation,
+            };
+            super::decode::submit(SAMPLE_PNG.to_vec(), move |decoded| {
+                finish_thumbnail_decode(job, SAMPLE_PNG.to_vec(), false, decoded);
+            })
+            .expect("completion decode should be admitted");
+            cancel_thumbnail(image_id);
+
+            wait_until(|| THUMBNAIL_QUEUE.with(|queue| queue.borrow().running == 0));
+            assert!(image.texture().is_none());
+            THUMBNAIL_CACHE.with(|cache| assert!(cache.borrow_mut().get(&key).is_none()));
             clear_thumbnail_runtime();
         },
     );

@@ -19,6 +19,42 @@ The existing one-shot pipeline remains: lookup and rendering run in
 application, and persistence is best effort. These meanings must be preserved
 when later diffs split the pipeline.
 
+## D02 decoded-texture cache
+
+Ready RAM entries contain one cloneable, normalized `gdk::MemoryTexture` for a
+source revision. Binding or applying a ready entry only assigns that paintable;
+it does not retain or parse PNG bytes. The display slot remains widget state, so
+the same texture is reused across Icons, List, and Columns sizes.
+
+A process-wide thumbnail-owned executor has two reusable decode threads and a
+bounded four-job queue. Each unique lookup/render completion is decoded once,
+normalized to premultiplied RGBA8, and downloaded with an explicit stride. RAM
+accounting uses the returned backing-buffer length after validating stride,
+dimensions, and checked size arithmetic rather than assuming every source
+texture occupies `width * height * 4`. The executor sends bounded completions
+through `glib::idle_add_once`; GTK targets and request registries are touched
+only when that thread-safe bridge runs on the main context.
+
+Only a successful parent decode enters the ready cache or persistence queue.
+A shared-cache PNG that passes header/tag checks but fails full decoding is a
+cache miss and retries through the existing one-shot renderer while retaining
+the original render permit and deduplicated targets. A malformed renderer
+result is a bounded failure. The Freedesktop `large` bucket, canonical 256 px
+render edge, URI/mtime tags, and best-effort persistence layout are unchanged.
+Lookup, rendering, and persistence still use their existing GIO blocking work
+until D03; D02 does not introduce lookup/render separation or persistent
+sandbox workers.
+
+The checked-in `gdk4` 0.11 bindings used here mark `Texture` and
+`MemoryTexture` as `Send + Sync`, and GDK's initialization assertion is a no-op
+because GDK 4 has no runtime initializer. This permits construction on the
+decode threads; widget mutation remains GTK-main-context-only.
+
+Shared-cache PNG remains untrusted codec input decoded in the unsandboxed
+parent. Header, dimension, and byte bounds limit work but do not make codec
+parsing safe. D02 moves that existing exposure off GTK; it does not resolve or
+claim approval of the open S3 trust-boundary decision.
+
 ## Reproducible baseline recipe
 
 Use disposable fixtures and an isolated XDG root. Do not remove or modify the

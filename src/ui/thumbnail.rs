@@ -15,6 +15,8 @@ use crate::{
     sandbox::{Cancellation, ParseOperation},
 };
 
+#[path = "thumbnail_decode.rs"]
+mod decode;
 mod slot;
 pub(crate) use slot::ThumbnailSlot;
 
@@ -216,13 +218,19 @@ struct ThumbnailCache {
 }
 
 #[derive(Clone)]
+struct ReadyThumbnail {
+    texture: gdk::Texture,
+    byte_len: usize,
+}
+
+#[derive(Clone)]
 enum CachedThumbnail {
-    Ready(gdk::Texture),
+    Ready(ReadyThumbnail),
     Failed(Instant),
 }
 
 enum CacheHit {
-    Ready(gdk::Texture),
+    Ready(ReadyThumbnail),
     Failed,
 }
 
@@ -241,8 +249,11 @@ impl ThumbnailCache {
         })
     }
 
-    fn insert(&mut self, key: ThumbnailKey, texture: gdk::Texture) {
-        self.insert_entry(key, CachedThumbnail::Ready(texture));
+    fn insert(&mut self, key: ThumbnailKey, texture: gdk::Texture, byte_len: usize) {
+        self.insert_entry(
+            key,
+            CachedThumbnail::Ready(ReadyThumbnail { texture, byte_len }),
+        );
     }
 
     fn insert_failure(&mut self, key: ThumbnailKey) {
@@ -278,10 +289,7 @@ impl ThumbnailCache {
 impl CachedThumbnail {
     fn byte_len(&self) -> usize {
         match self {
-            Self::Ready(texture) => {
-                (texture.width().max(0) as usize).saturating_mul(texture.height().max(0) as usize)
-                    * 4
-            }
+            Self::Ready(ready) => ready.byte_len,
             Self::Failed(_) => 0,
         }
     }
@@ -422,9 +430,9 @@ fn set_thumbnail_for_path(request: ThumbnailRequest<'_>) {
         file_size: request.file_size,
     };
     match THUMBNAIL_CACHE.with(|cache| cache.borrow_mut().get(&key)) {
-        Some(CacheHit::Ready(texture)) => {
+        Some(CacheHit::Ready(ready)) => {
             let (image_id, _) = prepare_thumbnail_target(request.image, thumbnail_size);
-            apply_thumbnail(request.image, &texture, &path);
+            apply_thumbnail(request.image, &ready.texture, &path);
             ACTIVE_REQUESTS.with(|requests| {
                 requests.borrow_mut().remove(&image_id);
             });
@@ -699,8 +707,8 @@ fn fire_parks(drained: Vec<SettledPark>, viewport: Option<&gtk::ScrolledWindow>)
         eligible += 1;
         if let Some(hit) = THUMBNAIL_CACHE.with(|cache| cache.borrow_mut().get(&park.key)) {
             match hit {
-                CacheHit::Ready(texture) => {
-                    apply_live_thumbnail(park.target, texture, park.key.path);
+                CacheHit::Ready(ready) => {
+                    apply_live_thumbnail(park.target, ready.texture, park.key.path);
                 }
                 CacheHit::Failed => {}
             }
@@ -870,28 +878,37 @@ fn start_thumbnail_jobs() {
 }
 
 async fn run_thumbnail_job(job: ThumbnailJob) {
-    let job_id = job.id;
-    let key = job.key.clone();
-    let path = key.path.clone();
+    run_thumbnail_stage(job, true).await;
+}
+
+async fn run_thumbnail_stage(job: ThumbnailJob, lookup_first: bool) {
+    let worker_job = ThumbnailJob {
+        id: job.id,
+        key: job.key.clone(),
+        kind: job.kind,
+        cancellation: job.cancellation.clone(),
+    };
     let result = gio::spawn_blocking(move || {
-        let lookup_started = std::time::Instant::now();
-        let cached = job
-            .key
-            .modified
-            .and_then(|mtime| super::thumbnail_cache::lookup(&job.key.path, mtime));
-        crate::metrics::record_thumbnail_stage(
-            crate::metrics::ThumbnailStage::Lookup,
-            lookup_started.elapsed(),
-        );
-        if let Some(png) = cached {
-            return Ok((png, false));
+        if lookup_first {
+            let lookup_started = std::time::Instant::now();
+            let cached = worker_job
+                .key
+                .modified
+                .and_then(|mtime| super::thumbnail_cache::lookup(&worker_job.key.path, mtime));
+            crate::metrics::record_thumbnail_stage(
+                crate::metrics::ThumbnailStage::Lookup,
+                lookup_started.elapsed(),
+            );
+            if let Some(png) = cached {
+                return Ok((png, false));
+            }
         }
         let render_started = std::time::Instant::now();
         let result = render_thumbnail(
-            &job.key.path,
-            job.kind,
+            &worker_job.key.path,
+            worker_job.kind,
             super::thumbnail_cache::CANONICAL_MAX_EDGE,
-            &job.cancellation,
+            &worker_job.cancellation,
         )
         .map(|png| (png, true));
         crate::metrics::record_thumbnail_stage(
@@ -901,31 +918,96 @@ async fn run_thumbnail_job(job: ThumbnailJob) {
         result
     })
     .await;
-    let targets = take_pending_targets(&key, job_id);
-    THUMBNAIL_QUEUE.with(|queue| queue.borrow_mut().finish());
-    if let Some(targets) = targets {
-        match result {
-            Ok(Ok((png, rendered))) => {
-                crate::metrics::mark_thumbnail_completed();
-                let texture = gdk::Texture::from_bytes(&glib::Bytes::from_owned(png.clone())).ok();
-                if let Some(texture) = texture {
-                    THUMBNAIL_CACHE
-                        .with(|cache| cache.borrow_mut().insert(key.clone(), texture.clone()));
-                    finish_thumbnail_targets(targets, Some(&texture), &path);
-                } else {
-                    finish_thumbnail_targets(targets, None, &path);
-                }
-                if rendered && let Some(mtime) = key.modified {
-                    enqueue_persist(key.path.clone(), mtime, png);
-                }
-            }
-            Ok(Err(_)) | Err(_) => {
-                crate::metrics::mark_thumbnail_cancelled();
-                THUMBNAIL_CACHE.with(|cache| cache.borrow_mut().insert_failure(key));
-                finish_thumbnail_targets(targets, None, &path);
+
+    match result {
+        Ok(Ok((png, rendered))) => {
+            let completion_png = png.clone();
+            let completion_job = ThumbnailJob {
+                id: job.id,
+                key: job.key.clone(),
+                kind: job.kind,
+                cancellation: job.cancellation.clone(),
+            };
+            if decode::submit(png, move |decoded| {
+                finish_thumbnail_decode(completion_job, completion_png, rendered, decoded);
+            })
+            .is_err()
+            {
+                finish_thumbnail_failure(job);
             }
         }
+        Ok(Err(_)) | Err(_) => finish_thumbnail_failure(job),
     }
+}
+
+fn finish_thumbnail_decode(
+    job: ThumbnailJob,
+    png: Vec<u8>,
+    rendered: bool,
+    decoded: Result<decode::DecodedTexture, String>,
+) {
+    match decoded {
+        Ok(decoded) => {
+            let targets = take_pending_targets(&job.key, job.id);
+            finish_thumbnail_slot();
+            if let Some(targets) = targets {
+                crate::metrics::mark_thumbnail_completed();
+                THUMBNAIL_CACHE.with(|cache| {
+                    cache.borrow_mut().insert(
+                        job.key.clone(),
+                        decoded.texture.clone(),
+                        decoded.byte_len,
+                    );
+                });
+                finish_thumbnail_targets(targets, Some(&decoded.texture), &job.key.path);
+                if rendered && let Some(mtime) = job.key.modified {
+                    enqueue_persist(job.key.path.clone(), mtime, png);
+                }
+            }
+        }
+        Err(_)
+            if should_promote_invalid_cache(
+                rendered,
+                pending_thumbnail_matches(&job.key, job.id),
+            ) =>
+        {
+            glib::MainContext::default().spawn_local(run_thumbnail_stage(job, false));
+            return;
+        }
+        Err(_) => finish_thumbnail_failure(job),
+    }
+    settle_thumbnail_pipeline();
+}
+
+fn should_promote_invalid_cache(rendered: bool, pending: bool) -> bool {
+    !rendered && pending
+}
+
+fn pending_thumbnail_matches(key: &ThumbnailKey, job_id: u64) -> bool {
+    PENDING_THUMBNAILS.with(|pending| {
+        pending
+            .borrow()
+            .get(key)
+            .is_some_and(|pending| pending.id == job_id)
+    })
+}
+
+fn finish_thumbnail_failure(job: ThumbnailJob) {
+    let targets = take_pending_targets(&job.key, job.id);
+    finish_thumbnail_slot();
+    if let Some(targets) = targets {
+        crate::metrics::mark_thumbnail_cancelled();
+        THUMBNAIL_CACHE.with(|cache| cache.borrow_mut().insert_failure(job.key.clone()));
+        finish_thumbnail_targets(targets, None, &job.key.path);
+    }
+    settle_thumbnail_pipeline();
+}
+
+fn finish_thumbnail_slot() {
+    THUMBNAIL_QUEUE.with(|queue| queue.borrow_mut().finish());
+}
+
+fn settle_thumbnail_pipeline() {
     start_thumbnail_jobs();
     retry_deferred_thumbnails();
     let counts = crate::metrics::thumbnail_counts();
