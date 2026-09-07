@@ -30,9 +30,7 @@ fn blocked_job(gate: Arc<(Mutex<bool>, Condvar)>, started: Arc<AtomicUsize>) -> 
             while !*ready {
                 ready = wake.wait(ready).expect("decode gate should remain usable");
             }
-            Err("released test decode".to_owned())
         }),
-        completion: Box::new(|_| {}),
     }
 }
 

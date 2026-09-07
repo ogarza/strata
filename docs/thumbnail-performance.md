@@ -14,10 +14,33 @@ for `lookup`, `render`, and `persist`. `parent_decode` and `apply` are reserved
 stage names for later instrumentation. Each sample adds one call and elapsed
 microseconds using relaxed atomics; no thumbnail payload or path is retained.
 
-The existing one-shot pipeline remains: lookup and rendering run in
-`gio::spawn_blocking`, successful PNG data is decoded by the parent before
-application, and persistence is best effort. These meanings must be preserved
-when later diffs split the pipeline.
+The D03 pipeline separates lookup from render admission. Lookup and PNG decode,
+one-shot sandbox spawn/wait, and persistence run on a bounded reusable
+thumbnail-owned executor; none use `gio::spawn_blocking` or block GTK. A lookup
+hit never acquires a render permit. A miss is promoted once to the existing
+one-shot sandbox renderer, retaining its deduplicated targets and render permit
+through decode. Persistence remains best effort.
+
+## D03 bounded thumbnail execution
+
+The process-wide executor has two reusable thumbnail-owned threads, a bounded
+64-job work queue, and a bounded thread-safe completion bridge. The existing
+64-entry pending-request table remains the global bound for unique pipeline
+work; lookup, render, decode, and persistence do not add independent per-stage
+request tables. Completion payloads and the persistence queue are bounded, and
+cancelled targets are rechecked before expensive work and before application.
+
+Warm disk hits proceed through lookup and decode while all four render permits
+are occupied. Render misses use the existing four-entry running render bound;
+contention defers work for retry rather than discarding live requests. Duplicate
+widgets continue to share one pending lookup/decode/render execution, and the
+same cancellation, stale-target, negative-cache, custom-icon, trash, canonical
+256 px, and cross-size texture behavior remains in force. The renderer is still
+one-shot; persistent sandbox workers are not part of D03.
+
+Stage timing retains separate lookup, render, parent-decode, and persist samples.
+`started` now records lookup admission and render admission, while
+`lookup_hits`/`lookup_misses` identify the lookup result.
 
 ## D02 decoded-texture cache
 
@@ -41,8 +64,9 @@ cache miss and retries through the existing one-shot renderer while retaining
 the original render permit and deduplicated targets. A malformed renderer
 result is a bounded failure. The Freedesktop `large` bucket, canonical 256 px
 render edge, URI/mtime tags, and best-effort persistence layout are unchanged.
-Lookup, rendering, and persistence still use their existing GIO blocking work
-until D03; D02 does not introduce lookup/render separation or persistent
+D03 moves the lookup, rendering, and persistence execution described above onto
+the shared thumbnail-owned executor; D02's texture representation and
+thread-safe completion bridge are reused. D03 does not introduce persistent
 sandbox workers.
 
 The checked-in `gdk4` 0.11 bindings used here mark `Texture` and

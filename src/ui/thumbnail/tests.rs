@@ -17,9 +17,8 @@ use super::{
     ThumbnailKey, ThumbnailKind, ThumbnailQueue, ViewSettle, cancel_thumbnail,
     clear_thumbnail_runtime, finish_thumbnail_decode, finish_thumbnail_targets,
     fire_settled_thumbnails, has_pending_thumbnail, hold_thumbnail_workers, note_metadata,
-    refresh_all_customized_icons, retry_deferred_thumbnail, schedule_or_defer,
-    set_thumbnail_or_icon, should_promote_invalid_cache, show_customized_icon,
-    take_pending_targets, thumbnail_kind,
+    refresh_all_customized_icons, schedule_or_defer, set_thumbnail_or_icon,
+    should_promote_invalid_cache, show_customized_icon, take_pending_targets, thumbnail_kind,
 };
 use crate::{
     model::{EntryKind, FileEntry, Location, MetadataValue},
@@ -133,7 +132,7 @@ fn thumbnail_queue_bounds_waiting_and_running_jobs() {
 }
 
 #[test]
-fn saturated_queue_defers_the_live_request() {
+fn saturated_render_queue_does_not_block_lookup_admission() {
     let _serial = crate::test_support::ASYNC_MAIN_CONTEXT_DEFAULT
         .lock()
         .expect("the async test lock should not be poisoned");
@@ -173,38 +172,12 @@ fn saturated_queue_defers_the_live_request() {
         assert!(settle.pending.is_empty());
     });
     ACTIVE_REQUESTS.with(|requests| {
-        let requests = requests.borrow();
-        let deferred = requests[&image_id]
-            .deferred
-            .as_ref()
-            .expect("request should be deferred");
-        assert_eq!(deferred.key, deferred_key);
-        assert_eq!(deferred.kind, ThumbnailKind::Image);
-    });
-    THUMBNAIL_QUEUE.with(|queue| {
-        let _removed = queue.borrow_mut().queued.pop_front();
-    });
-    let (image, deferred) = ACTIVE_REQUESTS.with(|requests| {
-        let requests = requests.borrow();
-        let active = &requests[&image_id];
-        (
-            active.image.clone(),
-            active.deferred.clone().expect("request should be deferred"),
-        )
-    });
-    assert!(retry_deferred_thumbnail(image_id, request, image, deferred));
-    ACTIVE_REQUESTS.with(|requests| {
         assert!(requests.borrow()[&image_id].deferred.is_none());
     });
     PENDING_THUMBNAILS.with(|pending| {
         assert!(pending.borrow().contains_key(&deferred_key));
-        pending.borrow_mut().clear();
     });
-    THUMBNAIL_QUEUE.with(|queue| {
-        assert_eq!(queue.borrow().queued.len(), MAX_QUEUED_THUMBNAILS);
-        queue.borrow_mut().queued.clear();
-    });
-    ACTIVE_REQUESTS.with(|requests| requests.borrow_mut().clear());
+    clear_thumbnail_runtime();
 }
 
 #[test]
@@ -704,7 +677,6 @@ fn cancellation_during_decode_completion_does_not_cache_or_apply() {
                     },
                 );
             });
-            THUMBNAIL_QUEUE.with(|queue| queue.borrow_mut().running = 1);
             let job = ThumbnailJob {
                 id: 11,
                 key: key.clone(),

@@ -9,7 +9,9 @@ use std::sync::{
 use gtk::{gdk, glib, prelude::*};
 
 const WORKER_COUNT: usize = 2;
-const MAX_QUEUED_DECODES: usize = 4;
+/// This queue is shared by lookup, decode, render, and persistence submissions. The
+/// thumbnail request table supplies the single global 64-entry pipeline bound.
+const MAX_QUEUED_DECODES: usize = 64;
 const MAX_QUEUED_COMPLETIONS: usize = MAX_QUEUED_DECODES + WORKER_COUNT;
 const MAX_TEXTURE_EDGE: i32 = 512;
 const MAX_TEXTURE_BYTES: usize = 512 * 512 * 4;
@@ -24,8 +26,7 @@ pub(super) struct DecodedTexture {
 }
 
 struct DecodeJob {
-    work: Box<dyn FnOnce() -> Result<DecodedTexture, String> + Send + 'static>,
-    completion: Box<dyn FnOnce(Result<DecodedTexture, String>) + Send + 'static>,
+    work: Box<dyn FnOnce() + Send + 'static>,
 }
 
 struct CompletionBridge {
@@ -83,6 +84,7 @@ impl CompletionBridge {
 
 struct DecodeExecutor {
     sender: SyncSender<DecodeJob>,
+    completions: Arc<CompletionBridge>,
 }
 
 impl DecodeExecutor {
@@ -92,13 +94,15 @@ impl DecodeExecutor {
         let completions = CompletionBridge::new();
         for index in 0..WORKER_COUNT {
             let receiver = receiver.clone();
-            let completions = completions.clone();
             std::thread::Builder::new()
-                .name(format!("strata-thumb-decode-{index}"))
-                .spawn(move || worker_loop(&receiver, &completions))
+                .name(format!("strata-thumb-exec-{index}"))
+                .spawn(move || worker_loop(&receiver))
                 .expect("thumbnail decode worker should start");
         }
-        Self { sender }
+        Self {
+            sender,
+            completions,
+        }
     }
 
     fn submit(&self, job: DecodeJob) -> Result<(), DecodeJob> {
@@ -109,7 +113,7 @@ impl DecodeExecutor {
     }
 }
 
-fn worker_loop(receiver: &Mutex<Receiver<DecodeJob>>, completions: &Arc<CompletionBridge>) {
+fn worker_loop(receiver: &Mutex<Receiver<DecodeJob>>) {
     loop {
         let job = receiver
             .lock()
@@ -118,13 +122,7 @@ fn worker_loop(receiver: &Mutex<Receiver<DecodeJob>>, completions: &Arc<Completi
         let Ok(job) = job else {
             return;
         };
-        let started = std::time::Instant::now();
-        let decoded = (job.work)();
-        crate::metrics::record_thumbnail_stage(
-            crate::metrics::ThumbnailStage::ParentDecode,
-            started.elapsed(),
-        );
-        completions.send(Box::new(move || (job.completion)(decoded)));
+        (job.work)();
     }
 }
 
@@ -133,16 +131,51 @@ fn executor() -> &'static DecodeExecutor {
     EXECUTOR.get_or_init(DecodeExecutor::new)
 }
 
+fn submit_work<R>(
+    work: impl FnOnce() -> R + Send + 'static,
+    completion: impl FnOnce(R) + Send + 'static,
+) -> Result<(), String>
+where
+    R: Send + 'static,
+{
+    let executor = executor();
+    let completions = executor.completions.clone();
+    executor
+        .submit(DecodeJob {
+            work: Box::new(move || {
+                let result = work();
+                completions.send(Box::new(move || completion(result)));
+            }),
+        })
+        .map_err(|_| "thumbnail executor queue is full".to_owned())
+}
+
 pub(super) fn submit(
     png: Vec<u8>,
     completion: impl FnOnce(Result<DecodedTexture, String>) + Send + 'static,
 ) -> Result<(), String> {
-    executor()
-        .submit(DecodeJob {
-            work: Box::new(move || decode_png(png)),
-            completion: Box::new(completion),
-        })
-        .map_err(|_| "thumbnail decode queue is full".to_owned())
+    submit_work(
+        move || {
+            let started = std::time::Instant::now();
+            let result = decode_png(png);
+            crate::metrics::record_thumbnail_stage(
+                crate::metrics::ThumbnailStage::ParentDecode,
+                started.elapsed(),
+            );
+            result
+        },
+        completion,
+    )
+}
+
+pub(super) fn submit_owned<R>(
+    work: impl FnOnce() -> R + Send + 'static,
+    completion: impl FnOnce(R) + Send + 'static,
+) -> Result<(), String>
+where
+    R: Send + 'static,
+{
+    submit_work(work, completion)
 }
 
 fn decode_png(png: Vec<u8>) -> Result<DecodedTexture, String> {

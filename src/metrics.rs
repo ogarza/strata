@@ -16,6 +16,8 @@ static FIRST_VISIBLE_ROW: AtomicBool = AtomicBool::new(false);
 static THUMB_ELIGIBLE: AtomicU64 = AtomicU64::new(0);
 static THUMB_REQUESTED: AtomicU64 = AtomicU64::new(0);
 static THUMB_STARTED: AtomicU64 = AtomicU64::new(0);
+static THUMB_LOOKUP_HITS: AtomicU64 = AtomicU64::new(0);
+static THUMB_LOOKUP_MISSES: AtomicU64 = AtomicU64::new(0);
 static THUMB_COMPLETED: AtomicU64 = AtomicU64::new(0);
 static THUMB_APPLIED: AtomicU64 = AtomicU64::new(0);
 static THUMB_CANCELLED: AtomicU64 = AtomicU64::new(0);
@@ -205,6 +207,8 @@ pub fn thumbnail_counts() -> ThumbnailCounts {
         eligible: THUMB_ELIGIBLE.load(Ordering::Relaxed),
         requested: THUMB_REQUESTED.load(Ordering::Relaxed),
         started: THUMB_STARTED.load(Ordering::Relaxed),
+        lookup_hits: THUMB_LOOKUP_HITS.load(Ordering::Relaxed),
+        lookup_misses: THUMB_LOOKUP_MISSES.load(Ordering::Relaxed),
         completed: THUMB_COMPLETED.load(Ordering::Relaxed),
         applied: THUMB_APPLIED.load(Ordering::Relaxed),
         cancelled: THUMB_CANCELLED.load(Ordering::Relaxed),
@@ -212,11 +216,29 @@ pub fn thumbnail_counts() -> ThumbnailCounts {
     }
 }
 
+pub fn mark_thumbnail_lookup_hit() {
+    THUMB_LOOKUP_HITS.fetch_add(1, Ordering::Relaxed);
+    tracing::debug!(
+        total = THUMB_LOOKUP_HITS.load(Ordering::Relaxed),
+        "thumbnail lookup hit"
+    );
+}
+
+pub fn mark_thumbnail_lookup_miss() {
+    THUMB_LOOKUP_MISSES.fetch_add(1, Ordering::Relaxed);
+    tracing::debug!(
+        total = THUMB_LOOKUP_MISSES.load(Ordering::Relaxed),
+        "thumbnail lookup miss"
+    );
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ThumbnailCounts {
     pub eligible: u64,
     pub requested: u64,
     pub started: u64,
+    pub lookup_hits: u64,
+    pub lookup_misses: u64,
     pub completed: u64,
     pub applied: u64,
     pub cancelled: u64,
