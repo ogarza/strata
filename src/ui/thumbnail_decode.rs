@@ -6,7 +6,7 @@ use std::sync::{
     mpsc::{Receiver, SyncSender, TrySendError, sync_channel},
 };
 
-use gtk::{gdk, glib, prelude::*};
+use gtk::{gdk, gdk_pixbuf, glib, prelude::*};
 
 const WORKER_COUNT: usize = 2;
 /// This queue is shared by lookup, decode, render, and persistence submissions. The
@@ -166,6 +166,63 @@ pub(super) fn submit(
         },
         completion,
     )
+}
+
+pub(super) fn submit_raw(
+    pixels: Vec<u8>,
+    width: i32,
+    height: i32,
+    stride: usize,
+    completion: impl FnOnce(Result<(DecodedTexture, Vec<u8>), String>) + Send + 'static,
+) -> Result<(), String> {
+    submit_work(
+        move || decode_raw(pixels, width, height, stride),
+        completion,
+    )
+}
+
+fn decode_raw(
+    pixels: Vec<u8>,
+    width: i32,
+    height: i32,
+    stride: usize,
+) -> Result<(DecodedTexture, Vec<u8>), String> {
+    if width <= 0 || height <= 0 || width > MAX_TEXTURE_EDGE || height > MAX_TEXTURE_EDGE {
+        return Err("thumbnail decoded outside the supported dimensions".to_owned());
+    }
+    let minimum_stride = usize::try_from(width)
+        .ok()
+        .and_then(|width| width.checked_mul(BYTES_PER_PIXEL))
+        .ok_or_else(|| "thumbnail row size overflowed".to_owned())?;
+    let required = stride
+        .checked_mul(usize::try_from(height).map_err(|_| "invalid thumbnail height")?)
+        .ok_or_else(|| "thumbnail texture size overflowed".to_owned())?;
+    if stride < minimum_stride || required != pixels.len() || required > MAX_TEXTURE_BYTES {
+        return Err("thumbnail pixel buffer has invalid bounds".to_owned());
+    }
+    let bytes = glib::Bytes::from_owned(pixels);
+    let texture =
+        gdk::MemoryTexture::new(width, height, gdk::MemoryFormat::R8g8b8a8, &bytes, stride)
+            .upcast();
+    let pixbuf = gdk_pixbuf::Pixbuf::from_bytes(
+        &bytes,
+        gdk_pixbuf::Colorspace::Rgb,
+        true,
+        8,
+        width,
+        height,
+        i32::try_from(stride).map_err(|_| "thumbnail stride overflowed")?,
+    );
+    let png = pixbuf
+        .save_to_bufferv("png", &[])
+        .map_err(|error| error.to_string())?;
+    Ok((
+        DecodedTexture {
+            texture,
+            byte_len: required,
+        },
+        png,
+    ))
 }
 
 pub(super) fn submit_owned<R>(

@@ -385,6 +385,33 @@ fn peer_closure_eagain_bounded_waits_and_allocation_bounds() {
 }
 
 #[test]
+fn raw_rgba_output_requires_exact_stride_and_length() {
+    let bytes = vec![0u8; 8];
+    let fd = sealed_memfd("raw-output", &bytes).expect("sealed raw output");
+    let reply = validate_reply_packet(Packet {
+        envelope: WireEnvelope::reply(1, Status::Ok, Representation::Rgba8, 1, 2, 4, 8),
+        fds: vec![fd],
+    })
+    .expect("valid raw output");
+    let JobReply::Success(output) = reply else {
+        panic!("success expected");
+    };
+    assert_eq!(output.metadata().representation, Representation::Rgba8);
+    assert_eq!(output.metadata().stride, 4);
+    assert_eq!(output.read_all().expect("read raw output"), bytes);
+
+    let fd = sealed_memfd("raw-bad-length", &[0u8; 8]).expect("sealed raw output");
+    assert_eq!(
+        validate_reply_packet(Packet {
+            envelope: WireEnvelope::reply(1, Status::Ok, Representation::Rgba8, 1, 2, 4, 4),
+            fds: vec![fd],
+        })
+        .expect_err("wrong raw length"),
+        ProtocolError::BadOutputLength
+    );
+}
+
+#[test]
 fn high_entropy_maximum_size_output_and_requested_edge_succeed() {
     let mut bytes = vec![0u8; THUMBNAIL_OUTPUT_CAP_BYTES as usize];
     let mut state = 0x1234_5678_9abc_def0u64;

@@ -27,6 +27,17 @@ const FILE_SIZE_LIMIT_BYTES: u64 = 512 * 1024 * 1024;
 const TEMPORARY_STORAGE_LIMIT_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_RASTER_INPUT_BYTES: u64 = 512 * 1024 * 1024;
 pub(crate) const MAX_OUTPUT_BYTES: u64 = 32 * 1024 * 1024;
+
+pub(crate) enum ThumbnailRender {
+    Png(Vec<u8>),
+    Raw {
+        pixels: Vec<u8>,
+        width: i32,
+        height: i32,
+        stride: usize,
+    },
+}
+
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -557,7 +568,7 @@ pub(crate) fn render_persistent_thumbnail(
     operation: protocol::Operation,
     value: i32,
     cancellation: &Cancellation,
-) -> Result<Vec<u8>, String> {
+) -> Result<ThumbnailRender, String> {
     thumbnail_pool::render_persistent_thumbnail(input, operation, value, cancellation)
 }
 

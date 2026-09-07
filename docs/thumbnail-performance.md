@@ -35,7 +35,7 @@ D06b records the approved security decisions for the persistent raster-worker pr
 
 The parent-side snapshot helper opens raster sources with `CLOEXEC` and `NONBLOCK`, rejects non-regular or oversized files, copies into an anonymous memfd, detects size/mtime changes during staging, and seals the snapshot against writes, growth, and shrink before it can be sent. The persistent worker command has no source path bind and no writable output bind. The helper entrypoint receives one sealed snapshot fd per request over the D06a protocol, decodes only through that fd, sends sealed output memfds, and remains reusable after bounded decode failures.
 
-The accepted S2 tradeoff means native decoder state can persist across raster files inside a worker. D06b documents that blast radius but does not implement per-file disposable decoder children. The accepted S3 scope keeps parent-side bounded PNG decoding for shared-cache entries and validated helper outputs; allocation and transport validation do not prove codec safety.
+The accepted S2 tradeoff means native decoder state can persist across raster files inside a worker. D06b documents that blast radius but does not implement per-file disposable decoder children. The accepted S3 scope keeps parent-side bounded PNG decoding for shared-cache entries; allocation and transport validation do not prove codec safety.
 
 ## D10 fixed total render policy
 
@@ -49,6 +49,20 @@ and idle-resident safeguards remain independent of CPU count.
 There is intentionally no user-facing worker preference: the four-slot behavior
 is the established D00/D07 comparison baseline, while decoder subprocesses and
 provider internals may use additional threads.
+
+## D11 raw-pixel worker replies
+
+D11 changes persistent image/PDF worker replies from PNG bytes to validated
+straight-alpha RGBA8 pixels in sealed output memfds. The wire metadata declares
+width, height, stride, and exact byte length; the parent rejects overflow,
+undersized rows, mismatched lengths, missing seals, and outputs beyond the
+existing cap before constructing a `MemoryTexture`.
+
+The parent no longer decodes the persistent worker's PNG reply. It encodes the
+validated pixels to PNG only on the bounded persistence path, preserving the
+Freedesktop thumbnail cache format. Shared-cache PNG lookup remains parent-side
+and bounded but unsandboxed, as required by the accepted S3 limitation. One-shot
+RAW/video and preview routes remain unchanged.
 
 ## D09 idle viewport scheduling
 
@@ -68,7 +82,7 @@ Production raster-image misses use the D06b sealed-snapshot worker through a laz
 
 Each helper is owned by a thumbnail supervision thread. Startup, request send/receive, reply validation, and output reading are bounded by the protocol deadlines. Crashes, protocol failures, timeouts, or failed startup retire the affected helper, release the scheduler slot through the normal completion path, and enter a short process-wide spawn backoff so a missing or broken sandbox cannot fan out across the 64-entry queue. Decode failures are classified as job failures and leave the worker reusable. Idle helpers retire back to zero after 30 seconds, and application shutdown asks idle helpers to exit. RAW, video, and previews remain on their previous one-shot routes; before starting one of those incompatible one-shot thumbnail backends, the pool retires one idle persistent helper so migration does not silently add a fifth resident sandbox process outside the four-slot render budget.
 
-D07 retains the D06b decisions and limitations. Sealed snapshots protect the original source from persistent raster workers, but decoder/library state may carry between raster files until the helper retires. The parent still performs bounded PNG decoding for shared-cache entries and validated worker outputs, so transport validation is not a codec-safety claim.
+D07 retains the D06b decisions and limitations. Sealed snapshots protect the original source from persistent raster workers, but decoder/library state may carry between raster files until the helper retires. The parent still performs bounded PNG decoding for shared-cache entries, while persistent worker replies are raw pixels; transport validation is not a codec-safety claim.
 
 ## D05 unified render budget
 
@@ -196,4 +210,4 @@ makes no performance claim until the owner reviews the results.
 
 ## Approved thumbnail worker decisions
 
-S1 is implemented for production raster workers with sealed bounded raster snapshot memfds; no original host source fd or path is sent to the persistent decoder. S2 accepts persistent decoder process reuse after that sealed-input proof and documents the cross-file decoder-state blast radius. S3 remains an accepted exposure for this stage: the parent decodes bounded PNG data from shared-cache entries and validated helper outputs, and those bounds do not prove codec safety.
+S1 is implemented for production raster workers with sealed bounded raster snapshot memfds; no original host source fd or path is sent to the persistent decoder. S2 accepts persistent decoder process reuse after that sealed-input proof and documents the cross-file decoder-state blast radius. S3 remains an accepted exposure for this stage: the parent decodes bounded PNG data from shared-cache entries, and those bounds do not prove codec safety.

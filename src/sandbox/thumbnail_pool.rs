@@ -9,7 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use super::{Cancellation, protocol};
+use super::{Cancellation, ThumbnailRender, protocol};
 
 const MAX_PERSISTENT_THUMBNAIL_WORKERS: usize = 4;
 const SPAWN_BACKOFF: Duration = Duration::from_millis(500);
@@ -54,7 +54,7 @@ struct RenderRequest {
 }
 
 struct RenderResult {
-    result: Result<Vec<u8>, String>,
+    result: Result<ThumbnailRender, String>,
     reusable: bool,
 }
 
@@ -67,7 +67,7 @@ pub(crate) fn render_persistent_thumbnail(
     operation: protocol::Operation,
     requested_edge: i32,
     cancellation: &Cancellation,
-) -> Result<Vec<u8>, String> {
+) -> Result<ThumbnailRender, String> {
     if cancellation.is_cancelled() {
         return Err("Preview cancelled".to_owned());
     }
@@ -382,12 +382,24 @@ impl WorkerRuntime {
             }
         };
         match self.session.accept_reply(packet) {
-            Ok(protocol::JobReply::Success(output)) => RenderResult {
-                result: output
-                    .read_all()
-                    .map_err(|error| format!("Unable to read thumbnail worker output: {error:?}")),
-                reusable: true,
-            },
+            Ok(protocol::JobReply::Success(output)) => {
+                let metadata = output.metadata();
+                RenderResult {
+                    result: output
+                        .read_all()
+                        .map(|pixels| ThumbnailRender::Raw {
+                            pixels,
+                            width: i32::from(metadata.width),
+                            height: i32::from(metadata.height),
+                            stride: usize::try_from(metadata.stride)
+                                .expect("validated thumbnail stride"),
+                        })
+                        .map_err(|error| {
+                            format!("Unable to read thumbnail worker output: {error:?}")
+                        }),
+                    reusable: true,
+                }
+            }
             Ok(protocol::JobReply::JobFailure(_)) => RenderResult {
                 result: Err("The thumbnail worker could not decode the image".to_owned()),
                 reusable: true,

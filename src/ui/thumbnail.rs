@@ -964,13 +964,34 @@ fn finish_thumbnail_lookup(mut job: ThumbnailJob, result: LookupResult) {
     }
 }
 
-fn finish_thumbnail_render(job: ThumbnailJob, result: Result<Vec<u8>, String>) {
+fn finish_thumbnail_render(
+    job: ThumbnailJob,
+    result: Result<crate::sandbox::ThumbnailRender, String>,
+) {
     match result {
-        Ok(png) => {
+        Ok(crate::sandbox::ThumbnailRender::Png(png)) => {
             let completion_png = png.clone();
             let completion_job = job.clone();
             if decode::submit(png, move |decoded| {
                 finish_thumbnail_decode(completion_job, completion_png, true, decoded);
+            })
+            .is_err()
+            {
+                finish_thumbnail_failure(job, true);
+            }
+        }
+        Ok(crate::sandbox::ThumbnailRender::Raw {
+            pixels,
+            width,
+            height,
+            stride,
+        }) => {
+            let completion_job = job.clone();
+            if decode::submit_raw(pixels, width, height, stride, move |result| match result {
+                Ok((decoded, png)) => {
+                    finish_thumbnail_decode(completion_job, png, true, Ok(decoded));
+                }
+                Err(_) => finish_thumbnail_failure(completion_job, true),
             })
             .is_err()
             {
@@ -1504,7 +1525,7 @@ fn render_thumbnail(
     kind: ThumbnailKind,
     size: i32,
     cancellation: &Cancellation,
-) -> Result<Vec<u8>, String> {
+) -> Result<crate::sandbox::ThumbnailRender, String> {
     if let Some(operation) = persistent_pool_operation(kind) {
         return crate::sandbox::render_persistent_thumbnail(
             path,
@@ -1528,7 +1549,7 @@ fn render_thumbnail(
         crate::sandbox::MediaPreviewBackend::Software,
         cancellation,
     )
-    .map(|output| output.data)
+    .map(|output| crate::sandbox::ThumbnailRender::Png(output.data))
 }
 
 #[cfg(test)]

@@ -89,7 +89,16 @@ fn thumbnail_worker_decodes_two_sealed_snapshots_and_survives_decode_failure() {
         };
         assert_eq!(output.metadata().width, edge);
         assert_eq!(output.metadata().height, edge * 3 / 4);
-        assert!(!output.read_all().expect("png output").is_empty());
+        assert_eq!(
+            output.metadata().representation,
+            crate::sandbox::protocol::Representation::Rgba8
+        );
+        assert_eq!(output.metadata().stride, edge as u32 * 4);
+        assert_eq!(
+            output.metadata().output_len,
+            u64::from(output.metadata().stride) * u64::from(output.metadata().height)
+        );
+        assert!(!output.read_all().expect("raw output").is_empty());
     }
 
     drop(parent);

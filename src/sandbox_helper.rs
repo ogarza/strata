@@ -70,10 +70,9 @@ pub(crate) fn run_thumbnail_worker(control: BorrowedFd<'_>) -> Result<(), String
         };
         match result {
             Ok(png) => {
-                let dimensions = png_dimensions(&png)
-                    .ok_or_else(|| "Thumbnail worker produced invalid PNG".to_owned())?;
+                let (pixels, width, height, stride) = rgba_pixels(&png)?;
                 let output =
-                    crate::sandbox::protocol::sealed_memfd("strata-thumbnail-output", &png)
+                    crate::sandbox::protocol::sealed_memfd("strata-thumbnail-output", &pixels)
                         .map_err(|error| {
                             format!("Unable to seal thumbnail worker output: {error:?}")
                         })?;
@@ -82,11 +81,11 @@ pub(crate) fn run_thumbnail_worker(control: BorrowedFd<'_>) -> Result<(), String
                     crate::sandbox::protocol::WireEnvelope::reply(
                         request.request_id,
                         crate::sandbox::protocol::Status::Ok,
-                        crate::sandbox::protocol::Representation::Png,
-                        dimensions.0,
-                        dimensions.1,
-                        0,
-                        png.len() as u64,
+                        crate::sandbox::protocol::Representation::Rgba8,
+                        width,
+                        height,
+                        stride,
+                        pixels.len() as u64,
                     ),
                     &[output.as_fd()],
                     crate::sandbox::protocol::REQUEST_DEADLINE,
@@ -147,17 +146,44 @@ pub(crate) fn run(arguments: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn png_dimensions(data: &[u8]) -> Option<(u16, u16)> {
-    if !data.starts_with(b"\x89PNG\r\n\x1a\n")
-        || data.get(8..12)? != 13u32.to_be_bytes()
-        || data.get(12..16)? != b"IHDR"
-    {
-        return None;
+fn rgba_pixels(data: &[u8]) -> Result<(Vec<u8>, u16, u16, u32), String> {
+    let loader = gdk_pixbuf::PixbufLoader::new();
+    loader
+        .write(data)
+        .and_then(|()| loader.close())
+        .map_err(|error| error.to_string())?;
+    let pixbuf = loader
+        .pixbuf()
+        .ok_or_else(|| "Thumbnail worker produced no pixels".to_owned())?;
+    let width = u16::try_from(pixbuf.width()).map_err(|_| "thumbnail width overflowed")?;
+    let height = u16::try_from(pixbuf.height()).map_err(|_| "thumbnail height overflowed")?;
+    let channels = pixbuf.n_channels();
+    if width == 0 || height == 0 || !(channels == 3 || channels == 4) {
+        return Err("Thumbnail worker produced invalid pixel metadata".to_owned());
     }
-    let width = u32::from_be_bytes(data.get(16..20)?.try_into().ok()?);
-    let height = u32::from_be_bytes(data.get(20..24)?.try_into().ok()?);
-    (width > 0 && height > 0)
-        .then(|| Some((u16::try_from(width).ok()?, u16::try_from(height).ok()?)))?
+    let stride = u32::from(width)
+        .checked_mul(4)
+        .ok_or_else(|| "thumbnail stride overflowed".to_owned())?;
+    let source_stride = usize::try_from(pixbuf.rowstride()).map_err(|_| "invalid rowstride")?;
+    let source = pixbuf.read_pixel_bytes();
+    let source = source.as_ref();
+    let channels = usize::try_from(channels).map_err(|_| "invalid channel count")?;
+    let row_bytes = usize::from(width) * channels;
+    let stride = usize::try_from(stride).map_err(|_| "thumbnail stride overflowed")?;
+    let mut pixels = vec![0u8; stride * usize::from(height)];
+    for row in 0..usize::from(height) {
+        let source_row = source
+            .get(row * source_stride..row * source_stride + row_bytes)
+            .ok_or_else(|| "thumbnail pixel buffer was truncated".to_owned())?;
+        let destination = &mut pixels[row * stride..(row + 1) * stride];
+        for (index, source) in source_row.chunks_exact(channels).enumerate() {
+            let destination = &mut destination[index * 4..index * 4 + 4];
+            destination[..3].copy_from_slice(&source[..3]);
+            destination[3] = if channels == 4 { source[3] } else { 255 };
+        }
+    }
+    let stride = u32::try_from(stride).map_err(|_| "thumbnail stride overflowed")?;
+    Ok((pixels, width, height, stride))
 }
 
 fn render_pixbuf(path: &Path, size: i32) -> Result<Vec<u8>, String> {

@@ -85,12 +85,14 @@ impl Status {
 #[repr(u16)]
 pub(crate) enum Representation {
     Png = 1,
+    Rgba8 = 2,
 }
 
 impl Representation {
     fn from_wire(value: u16) -> Option<Self> {
         match value {
             1 => Some(Self::Png),
+            2 => Some(Self::Rgba8),
             _ => None,
         }
     }
@@ -562,7 +564,6 @@ fn validate_output_metadata(envelope: &WireEnvelope) -> ProtocolResult<OutputMet
     let representation =
         Representation::from_wire(envelope.representation).ok_or(ProtocolError::InvalidMetadata)?;
     if envelope.operation != Operation::ThumbnailPng as u16
-        || representation != Representation::Png
         || envelope.width == 0
         || envelope.height == 0
         || envelope.width > MAX_EDGE
@@ -570,22 +571,42 @@ fn validate_output_metadata(envelope: &WireEnvelope) -> ProtocolResult<OutputMet
     {
         return Err(ProtocolError::InvalidMetadata);
     }
-    if envelope.stride != 0 {
-        return Err(ProtocolError::InvalidMetadata);
-    }
-    if envelope.output_len == 0 {
+    let minimum_stride = u64::from(envelope.width)
+        .checked_mul(4)
+        .ok_or(ProtocolError::AllocationLimit)?;
+    let (stride, required_len) = match representation {
+        Representation::Png => {
+            if envelope.stride != 0 || envelope.output_len == 0 {
+                return Err(ProtocolError::InvalidMetadata);
+            }
+            (0, envelope.output_len)
+        }
+        Representation::Rgba8 => {
+            if u64::from(envelope.stride) < minimum_stride {
+                return Err(ProtocolError::InvalidMetadata);
+            }
+            let required = u64::from(envelope.stride)
+                .checked_mul(u64::from(envelope.height))
+                .ok_or(ProtocolError::AllocationLimit)?;
+            if envelope.output_len != required {
+                return Err(ProtocolError::BadOutputLength);
+            }
+            (envelope.stride, required)
+        }
+    };
+    if required_len == 0 {
         return Err(ProtocolError::BadOutputLength);
     }
-    if envelope.output_len > THUMBNAIL_OUTPUT_CAP_BYTES {
+    if required_len > THUMBNAIL_OUTPUT_CAP_BYTES {
         return Err(ProtocolError::OutputTooLarge);
     }
-    usize::try_from(envelope.output_len).map_err(|_| ProtocolError::AllocationLimit)?;
+    usize::try_from(required_len).map_err(|_| ProtocolError::AllocationLimit)?;
     Ok(OutputMetadata {
         representation,
         width: envelope.width,
         height: envelope.height,
-        stride: envelope.stride,
-        output_len: envelope.output_len,
+        stride,
+        output_len: required_len,
     })
 }
 

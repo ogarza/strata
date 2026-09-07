@@ -11,7 +11,9 @@ use std::{
 
 use gtk::{gdk, glib, prelude::*};
 
-use super::{DecodeExecutor, DecodeJob, MAX_QUEUED_DECODES, WORKER_COUNT, decode_png, submit};
+use super::{
+    DecodeExecutor, DecodeJob, MAX_QUEUED_DECODES, WORKER_COUNT, decode_png, decode_raw, submit,
+};
 
 const PNG: &[u8] = &[
     0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
@@ -68,6 +70,16 @@ fn executor_bounds_running_and_queued_decodes() {
     );
     *gate.0.lock().expect("decode gate should not be poisoned") = true;
     gate.1.notify_all();
+}
+
+#[test]
+fn raw_rgba_pixels_become_a_texture_and_persistable_png() {
+    let (decoded, png) = decode_raw(vec![255, 0, 0, 255, 0, 255, 0, 128], 2, 1, 8)
+        .expect("raw pixels should decode");
+    assert_eq!(decoded.texture.width(), 2);
+    assert_eq!(decoded.texture.height(), 1);
+    assert_eq!(decoded.byte_len, 8);
+    assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
 }
 
 #[test]
