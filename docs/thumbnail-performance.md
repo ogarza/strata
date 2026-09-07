@@ -21,6 +21,22 @@ hit never acquires a render permit. A miss is promoted once to the existing
 one-shot sandbox renderer, retaining its deduplicated targets and render permit
 through decode. Persistence remains best effort.
 
+## D04 resolved source identity
+
+Thumbnail lookup now resolves local regular-file size and modification time on
+the thumbnail-owned executor when the browser entry does not have metadata yet.
+The resolved revision is used for cache lookup, pending-work rekeying, and
+subsequent render results, so thumbnails no longer wait for
+`BrowserEvent::MetadataFilled`. Callers for the same path coalesce while a
+revision is being resolved. Browser metadata filling still runs for size/date
+labels and sorting; it is no longer a thumbnail scheduling dependency.
+
+Resolution follows the existing local-path behavior and returns the original
+request key when stat fails or the path is not a regular file. The one-shot
+renderer still reopens the canonicalized path, so D04 does not claim atomic
+source snapshots or persistent-worker input isolation. Source replacement,
+symlink policy, and stronger identity validation remain follow-up concerns.
+
 ## D03 bounded thumbnail execution
 
 The process-wide executor has two reusable thumbnail-owned threads, a bounded

@@ -44,9 +44,6 @@ thread_local! {
     static THUMBNAIL_CACHE: RefCell<ThumbnailCache> = RefCell::new(ThumbnailCache::default());
     /// Per-viewport settle groups (key zero is the fallback); one view's fling never postpones another's.
     static SETTLE_VIEWS: RefCell<HashMap<usize, ViewSettle>> = RefCell::new(HashMap::new());
-    /// Parked while metadata is unknown to avoid rendering twice.
-    static METADATA_WAITERS: RefCell<HashMap<PathBuf, Vec<MetadataWaiter>>> =
-        RefCell::new(HashMap::new());
     static TRACKED_CUSTOMIZED_ICONS: RefCell<Vec<TrackedCustomizedIcon>> =
         const { RefCell::new(Vec::new()) };
     static TRACKED_THUMBNAILS: RefCell<Vec<TrackedThumbnail>> = const { RefCell::new(Vec::new()) };
@@ -87,7 +84,6 @@ struct SettledPark {
     key: ThumbnailKey,
     kind: ThumbnailKind,
     target: PendingTarget,
-    wait_for_metadata: bool,
 }
 
 struct ViewSettle {
@@ -98,12 +94,6 @@ struct ViewSettle {
     hooked: bool,
 }
 
-struct MetadataWaiter {
-    group: usize,
-    kind: ThumbnailKind,
-    target: PendingTarget,
-    file_size: Option<u64>,
-}
 #[derive(Clone)]
 struct PersistJob {
     path: PathBuf,
@@ -211,6 +201,11 @@ struct ThumbnailJob {
     key: ThumbnailKey,
     kind: ThumbnailKind,
     cancellation: Cancellation,
+}
+
+struct LookupResult {
+    key: ThumbnailKey,
+    cached: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -374,7 +369,6 @@ pub(super) fn set_thumbnail_or_icon(
         fallback_icon,
         icon_size,
         thumbnail_size,
-        wait_for_metadata: true,
     });
 }
 
@@ -394,7 +388,6 @@ pub(super) fn set_thumbnail_or_icon_for_path(
         fallback_icon,
         icon_size,
         thumbnail_size,
-        wait_for_metadata: false,
     });
 }
 
@@ -408,7 +401,6 @@ struct ThumbnailRequest<'a> {
     fallback_icon: &'a str,
     icon_size: i32,
     thumbnail_size: i32,
-    wait_for_metadata: bool,
 }
 
 fn set_thumbnail_for_path(request: ThumbnailRequest<'_>) {
@@ -474,7 +466,7 @@ fn set_thumbnail_for_path(request: ThumbnailRequest<'_>) {
     // Walking ancestors or hooking the viewport during bind can corrupt layout.
     glib::idle_add_local_once(move || {
         if request_is_live(&target) {
-            park_thumbnail(key, kind, target, request.wait_for_metadata);
+            park_thumbnail(key, kind, target);
         }
     });
 }
@@ -514,12 +506,7 @@ fn group_address(viewport: Option<&gtk::ScrolledWindow>) -> usize {
     viewport.map_or(0, |viewport| viewport.as_ptr() as usize)
 }
 
-fn park_thumbnail(
-    key: ThumbnailKey,
-    kind: ThumbnailKind,
-    target: PendingTarget,
-    wait_for_metadata: bool,
-) {
+fn park_thumbnail(key: ThumbnailKey, kind: ThumbnailKind, target: PendingTarget) {
     crate::metrics::mark_thumbnail_requested();
     let viewport = target.image.upgrade().and_then(|image| viewport_of(&image));
     let group = group_address(viewport.as_ref());
@@ -549,12 +536,7 @@ fn park_thumbnail(
                 hooked: false,
             };
         }
-        settle.pending.push(SettledPark {
-            key,
-            kind,
-            target,
-            wait_for_metadata,
-        });
+        settle.pending.push(SettledPark { key, kind, target });
         if settle.first_park.is_none() {
             settle.first_park = Some(Instant::now());
         }
@@ -567,7 +549,7 @@ fn park_thumbnail(
 
 #[cfg(test)]
 fn schedule_or_defer(key: ThumbnailKey, kind: ThumbnailKind, target: PendingTarget) {
-    park_thumbnail(key, kind, target, false);
+    park_thumbnail(key, kind, target);
 }
 fn mark_deferred(key: ThumbnailKey, kind: ThumbnailKind, image_id: usize, request: u64) {
     ACTIVE_REQUESTS.with(|requests| {
@@ -661,13 +643,6 @@ fn request_is_live(target: &PendingTarget) -> bool {
     })
 }
 
-fn target_live_image(target: &PendingTarget) -> Option<ThumbnailSlot> {
-    if !request_is_live(target) {
-        return None;
-    }
-    target.image.upgrade()
-}
-
 fn register_active_request(
     image: &ThumbnailSlot,
     image_id: usize,
@@ -711,7 +686,7 @@ fn apply_live_thumbnail(target: PendingTarget, texture: gdk::Texture, path: Path
     crate::metrics::mark_thumbnail_applied();
 }
 
-fn fire_parks(drained: Vec<SettledPark>, viewport: Option<&gtk::ScrolledWindow>) {
+fn fire_parks(drained: Vec<SettledPark>, _viewport: Option<&gtk::ScrolledWindow>) {
     let mut eligible = 0;
     let mut started = false;
     for park in drained {
@@ -728,10 +703,6 @@ fn fire_parks(drained: Vec<SettledPark>, viewport: Option<&gtk::ScrolledWindow>)
             }
             continue;
         }
-        if park.wait_for_metadata && park.key.modified.is_none() {
-            push_metadata_waiter(group_of_viewport(viewport), park);
-            continue;
-        }
         let image_id = park.target.image_id;
         let request = park.target.request;
         if schedule_thumbnail(park.key.clone(), park.kind, park.target) {
@@ -746,112 +717,19 @@ fn fire_parks(drained: Vec<SettledPark>, viewport: Option<&gtk::ScrolledWindow>)
     crate::metrics::mark_thumbnail_eligible(eligible);
 }
 
-fn group_of_viewport(viewport: Option<&gtk::ScrolledWindow>) -> usize {
-    group_address(viewport)
-}
-
-fn push_metadata_waiter(group: usize, park: SettledPark) {
-    METADATA_WAITERS.with(|waiters| {
-        let mut waiters = waiters.borrow_mut();
-        let queue = waiters.entry(park.key.path.clone()).or_default();
-        // Capped per file; extras re-park on their next bind.
-        if queue.len() < 8 {
-            queue.push(MetadataWaiter {
-                group,
-                kind: park.kind,
-                target: park.target,
-                file_size: park.key.file_size,
-            });
-        }
-    });
-}
-
-pub(super) fn note_metadata(path: &Path, modified: Option<i64>, file_size: Option<u64>) {
-    // A completed metadata attempt releases thumbnail work even when mtime is unavailable.
-    // Such renders remain memory-only because the shared cache cannot validate them.
-    SETTLE_VIEWS.with(|views| {
-        for settle in views.borrow_mut().values_mut() {
-            for park in &mut settle.pending {
-                if park.wait_for_metadata && park.key.path == path {
-                    park.key.modified = modified;
-                    park.key.file_size = file_size.or(park.key.file_size);
-                    park.wait_for_metadata = false;
-                }
-            }
-        }
-    });
-    ACTIVE_REQUESTS.with(|requests| {
-        for deferred in requests
-            .borrow_mut()
-            .values_mut()
-            .filter_map(|active| active.deferred.as_mut())
-        {
-            if deferred.key.path == path {
-                deferred.key.modified = modified;
-                deferred.key.file_size = file_size.or(deferred.key.file_size);
-            }
-        }
-    });
-    let Some(waiters) = METADATA_WAITERS.with(|waiters| waiters.borrow_mut().remove(path)) else {
-        return;
-    };
-    for waiter in waiters {
-        if target_live_image(&waiter.target).is_none() {
-            continue;
-        }
-        let key = ThumbnailKey {
-            path: path.to_path_buf(),
-            modified,
-            file_size: file_size.or(waiter.file_size),
-        };
-        park_into_group(waiter.group, key, waiter.kind, waiter.target, false);
-    }
-}
-pub(super) fn note_metadata_entry(entry: &FileEntry) {
-    let Some(path) = entry.local_thumbnail_path() else {
-        return;
-    };
-    note_metadata(
-        path,
-        known_metadata(&entry.modified_unix_seconds),
-        known_metadata(&entry.size),
-    );
-}
-
-fn park_into_group(
-    group: usize,
-    key: ThumbnailKey,
-    kind: ThumbnailKind,
-    target: PendingTarget,
-    wait_for_metadata: bool,
-) {
-    let known = SETTLE_VIEWS.with(|views| views.borrow().contains_key(&group));
-    if !known && group != 0 {
-        park_thumbnail(key, kind, target, wait_for_metadata);
-        return;
-    }
-    SETTLE_VIEWS.with(|views| {
-        let mut views = views.borrow_mut();
-        let Some(settle) = views.get_mut(&group) else {
-            return;
-        };
-        settle.pending.push(SettledPark {
-            key,
-            kind,
-            target,
-            wait_for_metadata,
-        });
-        if settle.first_park.is_none() {
-            settle.first_park = Some(Instant::now());
-        }
-    });
-    fire_view_group(group);
-}
-
 fn schedule_thumbnail(key: ThumbnailKey, kind: ThumbnailKind, target: PendingTarget) -> bool {
     PENDING_THUMBNAILS.with(|pending| {
         let mut pending = pending.borrow_mut();
         if let Some(pending) = pending.get_mut(&key) {
+            pending.targets.push(target);
+            true
+        } else if let Some(pending) = pending.iter_mut().find_map(|(existing_key, pending)| {
+            (existing_key.path == key.path
+                && (existing_key.modified.is_none()
+                    || key.modified.is_none()
+                    || existing_key.modified == key.modified))
+                .then_some(pending)
+        }) {
             pending.targets.push(target);
             true
         } else {
@@ -891,17 +769,17 @@ fn start_thumbnail_jobs() {
         if decode::submit_owned(
             move || {
                 let started = Instant::now();
-                let cached = lookup_job
-                    .key
+                let key = resolve_source_key(&lookup_job.key);
+                let cached = key
                     .modified
-                    .and_then(|mtime| super::thumbnail_cache::lookup(&lookup_job.key.path, mtime));
+                    .and_then(|mtime| super::thumbnail_cache::lookup(&key.path, mtime));
                 crate::metrics::record_thumbnail_stage(
                     crate::metrics::ThumbnailStage::Lookup,
                     started.elapsed(),
                 );
-                cached
+                LookupResult { key, cached }
             },
-            move |cached| finish_thumbnail_lookup(job, cached),
+            move |result| finish_thumbnail_lookup(job, result),
         )
         .is_err()
         {
@@ -953,7 +831,63 @@ fn start_render_jobs() {
     }
 }
 
-fn finish_thumbnail_lookup(job: ThumbnailJob, cached: Option<Vec<u8>>) {
+fn resolve_source_key(key: &ThumbnailKey) -> ThumbnailKey {
+    let Ok(metadata) = std::fs::metadata(&key.path) else {
+        return key.clone();
+    };
+    if !metadata.is_file() {
+        return key.clone();
+    }
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|duration| i64::try_from(duration.as_secs()).ok());
+    ThumbnailKey {
+        path: key.path.clone(),
+        modified: key.modified.or(modified),
+        file_size: key.file_size.or(Some(metadata.len())),
+    }
+}
+
+fn rekey_pending_thumbnail(job: &ThumbnailJob, key: ThumbnailKey) -> Option<ThumbnailJob> {
+    PENDING_THUMBNAILS.with(|pending| {
+        let mut pending = pending.borrow_mut();
+        let current = pending.get(&job.key)?;
+        if current.id != job.id {
+            return None;
+        }
+        if key == job.key {
+            return Some(job.clone());
+        }
+        let current = pending.remove(&job.key)?;
+        if let Some(existing) = pending.get_mut(&key) {
+            existing.targets.extend(current.targets);
+            return Some(ThumbnailJob {
+                id: existing.id,
+                key,
+                kind: existing.kind,
+                cancellation: existing.cancellation.clone(),
+            });
+        }
+        let id = current.id;
+        pending.insert(key.clone(), current);
+        Some(ThumbnailJob {
+            id,
+            key,
+            kind: job.kind,
+            cancellation: job.cancellation.clone(),
+        })
+    })
+}
+
+fn finish_thumbnail_lookup(mut job: ThumbnailJob, result: LookupResult) {
+    if let Some(resolved) = rekey_pending_thumbnail(&job, result.key) {
+        job = resolved;
+    } else {
+        return;
+    }
+    let cached = result.cached;
     if !pending_thumbnail_matches(&job.key, job.id) {
         return;
     }
@@ -1446,12 +1380,6 @@ fn refresh_tracked_icons(matches: impl Fn(&TrackedCustomizedIcon) -> bool) {
 fn cancel_thumbnail(image_id: usize) {
     ACTIVE_REQUESTS.with(|requests| {
         requests.borrow_mut().remove(&image_id);
-    });
-    METADATA_WAITERS.with(|waiters| {
-        waiters.borrow_mut().retain(|_, targets| {
-            targets.retain(|waiter| waiter.target.image_id != image_id);
-            !targets.is_empty()
-        });
     });
     SETTLE_VIEWS.with(|views| {
         views.borrow_mut().retain(|_, settle| {

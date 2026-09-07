@@ -134,46 +134,6 @@ fn trash_thumbnails_and_fallback_icons_work_in_every_view() {
     window.destroy();
 }
 
-#[test]
-fn metadata_updates_use_the_local_trash_thumbnail_source() {
-    let path = Path::new("/fixture/Trash/files/photo.png.2");
-    let entry = entry("photo.png", EntryKind::File, path);
-    thumbnail::SETTLE_VIEWS.with(|views| {
-        views.borrow_mut().insert(
-            0,
-            thumbnail::ViewSettle {
-                viewport: glib::WeakRef::new(),
-                pending: vec![thumbnail::SettledPark {
-                    key: thumbnail::ThumbnailKey {
-                        path: path.to_owned(),
-                        modified: None,
-                        file_size: None,
-                    },
-                    kind: thumbnail::ThumbnailKind::Image,
-                    target: thumbnail::PendingTarget {
-                        image_id: 1,
-                        request: 1,
-                        image: glib::WeakRef::new(),
-                    },
-                    wait_for_metadata: true,
-                }],
-                timer: None,
-                first_park: None,
-                hooked: false,
-            },
-        );
-    });
-    thumbnail::note_metadata_entry(&entry);
-    thumbnail::SETTLE_VIEWS.with(|views| {
-        let mut views = views.borrow_mut();
-        let pending = &views[&0].pending[0];
-        assert_eq!(pending.key.modified, Some(1));
-        assert_eq!(pending.key.file_size, Some(42));
-        assert!(!pending.wait_for_metadata);
-        views.clear();
-    });
-}
-
 fn has_visible_thumbnail(path: &Path) -> bool {
     thumbnail::TRACKED_THUMBNAILS.with(|tracked| {
         tracked.borrow().iter().any(|tracked| {
