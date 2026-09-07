@@ -1461,6 +1461,10 @@ fn is_heavy(kind: ThumbnailKind) -> bool {
     )
 }
 
+fn uses_persistent_raster_pool(kind: ThumbnailKind) -> bool {
+    kind == ThumbnailKind::Image
+}
+
 fn thumbnail_kind(path: &Path) -> Option<ThumbnailKind> {
     let extension = path.extension()?.to_str()?.to_ascii_lowercase();
     match extension.as_str() {
@@ -1484,12 +1488,20 @@ fn render_thumbnail(
     size: i32,
     cancellation: &Cancellation,
 ) -> Result<Vec<u8>, String> {
+    if uses_persistent_raster_pool(kind) {
+        return crate::sandbox::render_persistent_thumbnail(
+            path,
+            size.clamp(16, 256),
+            cancellation,
+        );
+    }
     let operation = match kind {
-        ThumbnailKind::Image => ParseOperation::ThumbnailImage,
+        ThumbnailKind::Image => unreachable!("image thumbnails use the persistent raster pool"),
         ThumbnailKind::RawImage => ParseOperation::ThumbnailRaw,
         ThumbnailKind::Pdf => ParseOperation::ThumbnailPdf,
         ThumbnailKind::Video => ParseOperation::ThumbnailVideo,
     };
+    crate::sandbox::retire_idle_thumbnail_worker_for_oneshot();
     crate::sandbox::parse(
         path,
         operation,
@@ -1522,6 +1534,7 @@ pub(super) fn hold_thumbnail_workers() {
 
 #[cfg(test)]
 pub(super) fn clear_thumbnail_runtime() {
+    crate::sandbox::shutdown_thumbnail_worker_pool();
     THUMBNAIL_QUEUE.with(|queue| {
         let mut queue = queue.borrow_mut();
         queue.running = 0;

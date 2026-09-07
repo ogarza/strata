@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 pub(crate) mod protocol;
+mod thumbnail_pool;
 
 use std::{
     fs,
@@ -59,6 +60,13 @@ impl MediaPreviewBackend {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ParseOperation {
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "D07 routes production raster thumbnails through the persistent pool"
+        )
+    )]
     ThumbnailImage,
     ThumbnailRaw,
     ThumbnailPdf,
@@ -386,13 +394,6 @@ fn wait_for_renderer_output(
     }
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "D06b proves persistent workers before production thumbnail routing uses them"
-    )
-)]
 pub(crate) fn sealed_raster_snapshot(input: &Path) -> Result<OwnedFd, String> {
     let input = input
         .canonicalize()
@@ -466,13 +467,6 @@ fn copy_source_to_snapshot(source: &OwnedFd, snapshot: &OwnedFd) -> Result<(), S
     Ok(())
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "D06b proves persistent workers before production thumbnail routing uses them"
-    )
-)]
 pub(crate) fn persistent_thumbnail_worker_command(executable: &Path) -> Command {
     let mut command = Command::new("bwrap");
     command.args([
@@ -540,10 +534,6 @@ pub(crate) fn persistent_thumbnail_worker_command(executable: &Path) -> Command 
     command
 }
 
-#[expect(
-    dead_code,
-    reason = "D06b proves persistent workers before production thumbnail routing uses them"
-)]
 pub(crate) fn spawn_persistent_thumbnail_worker(
     executable: &Path,
 ) -> Result<(Child, OwnedFd), String> {
@@ -556,6 +546,22 @@ pub(crate) fn spawn_persistent_thumbnail_worker(
     let child = spawn_renderer(&mut command)
         .map_err(|error| format!("Unable to start the thumbnail worker sandbox: {error}"))?;
     Ok((child, parent_socket))
+}
+
+pub(crate) fn render_persistent_thumbnail(
+    input: &Path,
+    value: i32,
+    cancellation: &Cancellation,
+) -> Result<Vec<u8>, String> {
+    thumbnail_pool::render_persistent_thumbnail(input, value, cancellation)
+}
+
+pub(crate) fn retire_idle_thumbnail_worker_for_oneshot() {
+    thumbnail_pool::retire_idle_thumbnail_worker_for_oneshot();
+}
+
+pub(crate) fn shutdown_thumbnail_worker_pool() {
+    thumbnail_pool::shutdown_thumbnail_worker_pool();
 }
 
 fn sandbox_command(

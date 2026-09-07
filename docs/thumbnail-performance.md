@@ -37,6 +37,14 @@ The parent-side snapshot helper opens raster sources with `CLOEXEC` and `NONBLOC
 
 The accepted S2 tradeoff means native decoder state can persist across raster files inside a worker. D06b documents that blast radius but does not implement per-file disposable decoder children. The accepted S3 scope keeps parent-side bounded PNG decoding for shared-cache entries and validated helper outputs; allocation and transport validation do not prove codec safety.
 
+## D07 persistent raster pool
+
+Production raster-image misses now use the D06b sealed-snapshot worker through a lazy process-wide pool. The pool starts with zero helpers and creates a sandbox only after the existing scheduler admits a visible raster miss. Disk-cache hits and RAM hits do not spawn helpers. Healthy raster helpers are reused across rows, folders, views, and windows; each worker still handles one active request at a time over the D06a protocol and receives only a sealed bounded snapshot memfd, never an original source path or host source fd.
+
+Each helper is owned by a thumbnail supervision thread. Startup, request send/receive, reply validation, and output reading are bounded by the protocol deadlines. Crashes, protocol failures, timeouts, or failed startup retire the affected helper, release the scheduler slot through the normal completion path, and enter a short process-wide spawn backoff so a missing or broken sandbox cannot fan out across the 64-entry queue. Decode failures are classified as job failures and leave the worker reusable. Idle helpers retire back to zero after 30 seconds, and application shutdown asks idle helpers to exit. RAW, PDF, video, and previews remain on their previous one-shot routes; before starting one of those incompatible one-shot thumbnail backends, the pool retires one idle raster helper so migration does not silently add a fifth resident sandbox process outside the four-slot render budget.
+
+D07 retains the D06b decisions and limitations. Sealed snapshots protect the original source from persistent raster workers, but decoder/library state may carry between raster files until the helper retires. The parent still performs bounded PNG decoding for shared-cache entries and validated worker outputs, so transport validation is not a codec-safety claim.
+
 ## D05 unified render budget
 
 Render misses now use a single four-slot scheduler. RAW, PDF, and video jobs are
@@ -161,11 +169,6 @@ and tails only with enough repeated samples; do not call an uncontrolled run
 "cold filesystem". D00 establishes measurements and proposed tolerances; it
 makes no performance claim until the owner reviews the results.
 
-## Open decisions
+## Approved thumbnail worker decisions
 
-S1 (source protection), S2 (persistent decoder state), and S3 (cache/helper
-codec trust boundary) remain open. D00 records evidence and can proceed
-independently; no persistent worker or unapproved source-FD capability is
-introduced by this diff. The proposed architecture and transport/concurrency
-choices remain in the local implementation plan until their respective diffs
-are reviewed.
+S1 is implemented for production raster workers with sealed bounded raster snapshot memfds; no original host source fd or path is sent to the persistent decoder. S2 accepts persistent decoder process reuse after that sealed-input proof and documents the cross-file decoder-state blast radius. S3 remains an accepted exposure for this stage: the parent decodes bounded PNG data from shared-cache entries and validated helper outputs, and those bounds do not prove codec safety.
