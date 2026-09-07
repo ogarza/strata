@@ -23,20 +23,11 @@ static THUMB_APPLIED: AtomicU64 = AtomicU64::new(0);
 static THUMB_CANCELLED: AtomicU64 = AtomicU64::new(0);
 static THUMB_STALE: AtomicU64 = AtomicU64::new(0);
 
-static THUMB_STAGE_CALLS: [AtomicU64; 5] = [
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-];
-static THUMB_STAGE_MICROS: [AtomicU64; 5] = [
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-];
+const THUMB_STAGE_COUNT: usize = 7;
+static THUMB_STAGE_CALLS: [AtomicU64; THUMB_STAGE_COUNT] =
+    [const { AtomicU64::new(0) }; THUMB_STAGE_COUNT];
+static THUMB_STAGE_MICROS: [AtomicU64; THUMB_STAGE_COUNT] =
+    [const { AtomicU64::new(0) }; THUMB_STAGE_COUNT];
 
 pub fn initialize() {
     let _started = STARTED.set(Instant::now());
@@ -144,6 +135,31 @@ pub enum ThumbnailStage {
     ParentDecode = 2,
     Persist = 3,
     Apply = 4,
+    LookupWait = 5,
+    RenderWait = 6,
+}
+
+pub fn thumbnail_viewport_metrics_enabled() -> bool {
+    tracing::enabled!(tracing::Level::DEBUG)
+}
+
+pub fn record_thumbnail_viewport(
+    viewport_id: u64,
+    epoch: u64,
+    milestone: &str,
+    total: usize,
+    ready: usize,
+    elapsed: std::time::Duration,
+) {
+    tracing::debug!(
+        viewport_id,
+        epoch,
+        milestone,
+        total,
+        ready,
+        elapsed_micros = elapsed.as_micros() as u64,
+        "thumbnail post-settle viewport painted"
+    );
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

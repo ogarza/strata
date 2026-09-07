@@ -32,6 +32,17 @@ fn stage_timing_accumulates_samples() {
 }
 
 #[test]
+fn queue_wait_samples_are_separate_from_service_work() {
+    for stage in [ThumbnailStage::LookupWait, ThumbnailStage::RenderWait] {
+        let before = thumbnail_stage_stats(stage);
+        record_thumbnail_stage(stage, std::time::Duration::from_micros(19));
+        let after = thumbnail_stage_stats(stage);
+        assert_eq!(after.calls, before.calls + 1);
+        assert_eq!(after.total_micros, before.total_micros + 19);
+    }
+}
+
+#[test]
 fn stage_probes_do_not_panic() {
     record_stage("test-enumeration", 3);
     mark_first_themed_frame();

@@ -23,7 +23,7 @@ use rustix::{
 };
 
 const MAGIC: [u8; 4] = *b"STTP";
-const VERSION: u16 = 1;
+const VERSION: u16 = 2;
 pub(crate) const CONTROL_PACKET_BYTES: usize = 48;
 pub(crate) const STARTUP_DEADLINE: Duration = Duration::from_secs(2);
 pub(crate) const REQUEST_DEADLINE: Duration = Duration::from_secs(12);
@@ -414,7 +414,22 @@ pub(crate) fn recv_packet(
     deadline: Duration,
     expected_fds: usize,
 ) -> ProtocolResult<Packet> {
-    if expected_fds > MAX_FDS {
+    recv_packet_with_fds(socket, deadline, Some(expected_fds))
+}
+
+pub(crate) fn recv_reply_packet(
+    socket: BorrowedFd<'_>,
+    deadline: Duration,
+) -> ProtocolResult<Packet> {
+    recv_packet_with_fds(socket, deadline, None)
+}
+
+fn recv_packet_with_fds(
+    socket: BorrowedFd<'_>,
+    deadline: Duration,
+    expected_fds: Option<usize>,
+) -> ProtocolResult<Packet> {
+    if expected_fds.is_some_and(|count| count > MAX_FDS) {
         return Err(ProtocolError::UnexpectedDescriptors);
     }
     wait_for(socket, PollFlags::IN, deadline)?;
@@ -448,7 +463,12 @@ pub(crate) fn recv_packet(
             _ => return Err(ProtocolError::UnexpectedDescriptors),
         }
     }
-    if fds.len() != expected_fds {
+    if fds.len() > MAX_FDS {
+        return Err(ProtocolError::UnexpectedDescriptors);
+    }
+    if let Some(expected_fds) = expected_fds
+        && fds.len() != expected_fds
+    {
         let received = fds.len();
         drop(fds);
         return Err(if received < expected_fds {

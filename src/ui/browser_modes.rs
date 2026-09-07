@@ -2221,6 +2221,7 @@ fn install_scroll_settle(
         let scroll = scroll.clone();
         let on_settle = on_settle.clone();
         adjustment.connect_value_changed(move |_| {
+            super::thumbnail::set_viewport_scrolling(&scroll, true);
             let started = !scrolling.replace(true);
             if started && let Some(css_class) = css_class {
                 let scrolling = scrolling.clone();
@@ -2243,6 +2244,7 @@ fn install_scroll_settle(
                 move || {
                     pending_for_timeout.borrow_mut().take();
                     scrolling.set(false);
+                    super::thumbnail::set_viewport_scrolling(&scroll, false);
                     if let Some(css_class) = css_class {
                         scroll.remove_css_class(css_class);
                     }
@@ -2738,6 +2740,12 @@ fn build_list_pane(
             set_label_if_changed(&kind, entry_type(&entry));
             super::accessibility::describe_entry(item, &entry.display_name, Some(&entry));
             if scrolling_for_bind.get() {
+                super::thumbnail::show_deferred_thumbnail_or_icon(
+                    &icon,
+                    &entry,
+                    super::browser::entry_icon(&entry),
+                    18,
+                );
                 set_label_if_changed(&modified, &crate::util::modified_date(&entry));
             } else {
                 set_mode_cut_style(&row, cuts_for_bind.borrow().contains(&entry.location));
@@ -3867,8 +3875,9 @@ fn apply_icons_entry(
         label.set_text(Some(&entry.display_name));
     }
     if scrolling {
-        super::thumbnail::show_fallback_icon(
+        super::thumbnail::show_deferred_thumbnail_or_icon(
             &icon,
+            entry,
             super::browser::entry_icon(entry),
             thumbnail_size,
         );

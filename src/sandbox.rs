@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 pub(crate) mod protocol;
+mod source;
 mod thumbnail_pool;
+pub(crate) use source::SourceRevision;
+pub(crate) use thumbnail_pool::RENDER_LIMIT;
 
 use std::{
     fs,
@@ -28,6 +31,19 @@ const TEMPORARY_STORAGE_LIMIT_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_RASTER_INPUT_BYTES: u64 = 512 * 1024 * 1024;
 pub(crate) const MAX_OUTPUT_BYTES: u64 = 32 * 1024 * 1024;
 
+#[derive(Debug)]
+pub(crate) enum ThumbnailError {
+    Content,
+    Service(String),
+}
+
+impl From<String> for ThumbnailError {
+    fn from(error: String) -> Self {
+        Self::Service(error)
+    }
+}
+
+#[derive(Clone)]
 pub(crate) enum ThumbnailRender {
     Png(Vec<u8>),
     Raw {
@@ -409,7 +425,21 @@ fn wait_for_renderer_output(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn sealed_raster_snapshot(input: &Path) -> Result<OwnedFd, String> {
+    sealed_raster_snapshot_checked(
+        input,
+        SourceRevision::read(input)?,
+        &Cancellation::default(),
+    )
+}
+
+fn sealed_raster_snapshot_checked(
+    input: &Path,
+    expected: SourceRevision,
+    cancellation: &Cancellation,
+) -> Result<OwnedFd, String> {
+    let original_path = input;
     let input = input
         .canonicalize()
         .map_err(|error| format!("Unable to open preview input: {error}"))?;
@@ -434,18 +464,33 @@ pub(crate) fn sealed_raster_snapshot(input: &Path) -> Result<OwnedFd, String> {
         rustix::fs::MemfdFlags::CLOEXEC.union(rustix::fs::MemfdFlags::ALLOW_SEALING),
     )
     .map_err(|error| format!("Unable to create preview input snapshot: {error}"))?;
-    copy_source_to_snapshot(&source, &snapshot)?;
-    let after = rustix::fs::fstat(&source)
-        .map_err(|error| format!("Unable to reinspect preview input: {error}"))?;
-    if before.st_size != after.st_size || before.st_mtime != after.st_mtime {
+    let source = fs::File::from(source);
+    let revision =
+        SourceRevision::from_metadata(&source.metadata().map_err(|error| error.to_string())?)?;
+    if revision != expected {
+        return Err("Thumbnail source changed before staging".to_owned());
+    }
+    copy_source_to_snapshot(&source, &snapshot, expected.size, cancellation)?;
+    let after =
+        SourceRevision::from_metadata(&source.metadata().map_err(|error| error.to_string())?)?;
+    if revision != after || !revision.matches(original_path) {
         return Err("Preview input changed while it was being snapshotted".to_owned());
     }
     Ok(snapshot)
 }
 
-fn copy_source_to_snapshot(source: &OwnedFd, snapshot: &OwnedFd) -> Result<(), String> {
+fn copy_source_to_snapshot(
+    source: &fs::File,
+    snapshot: &OwnedFd,
+    expected_size: u64,
+    cancellation: &Cancellation,
+) -> Result<(), String> {
     let mut copied = 0u64;
+    let deadline = Instant::now() + protocol::REQUEST_DEADLINE;
     loop {
+        if cancellation.is_cancelled() || Instant::now() >= deadline {
+            return Err("Thumbnail staging cancelled or timed out".to_owned());
+        }
         let mut buffer = [0u8; 64 * 1024];
         let read = rustix::io::retry_on_intr(|| rustix::io::read(source, buffer.as_mut_slice()))
             .map_err(|error| format!("Unable to read preview input snapshot: {error}"))?;
@@ -455,7 +500,7 @@ fn copy_source_to_snapshot(source: &OwnedFd, snapshot: &OwnedFd) -> Result<(), S
         copied = copied
             .checked_add(read as u64)
             .ok_or_else(|| "Preview input exceeds the supported size limit".to_owned())?;
-        if copied > MAX_RASTER_INPUT_BYTES {
+        if copied > expected_size {
             return Err("Preview input exceeds the supported size limit".to_owned());
         }
         let mut written = 0;
@@ -468,6 +513,9 @@ fn copy_source_to_snapshot(source: &OwnedFd, snapshot: &OwnedFd) -> Result<(), S
             }
             written += count;
         }
+    }
+    if copied != expected_size {
+        return Err("Thumbnail source changed during staging".to_owned());
     }
     rustix::fs::ftruncate(snapshot, copied)
         .map_err(|error| format!("Unable to seal preview input snapshot: {error}"))?;
@@ -568,12 +616,12 @@ pub(crate) fn render_persistent_thumbnail(
     operation: protocol::Operation,
     value: i32,
     cancellation: &Cancellation,
-) -> Result<ThumbnailRender, String> {
+) -> Result<ThumbnailRender, ThumbnailError> {
     thumbnail_pool::render_persistent_thumbnail(input, operation, value, cancellation)
 }
 
-pub(crate) fn retire_idle_thumbnail_worker_for_oneshot() {
-    thumbnail_pool::retire_idle_thumbnail_worker_for_oneshot();
+pub(crate) fn reserve_thumbnail_oneshot() -> Result<thumbnail_pool::ResidentSlot, String> {
+    thumbnail_pool::reserve_oneshot()
 }
 
 pub(crate) fn shutdown_thumbnail_worker_pool() {

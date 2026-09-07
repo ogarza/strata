@@ -85,8 +85,9 @@ fn trash_thumbnails_and_fallback_icons_work_in_every_view() {
     pixbuf.new_subpixbuf(0, 24, 64, 24).fill(0x448844ff);
     let png = pixbuf.save_to_bufferv("png", &[]).expect("PNG fixture");
     std::fs::write(&path, &png).expect("image file");
-    thumbnail_cache::store(&path, 1, &png);
-    assert!(thumbnail_cache::lookup(&path, 1).is_some());
+    let revision = crate::sandbox::SourceRevision::read(&path).expect("source revision");
+    thumbnail_cache::store(&path, revision.modified, &png);
+    assert!(thumbnail_cache::lookup(&path, revision.modified).is_some());
     let image = entry("photo.png", EntryKind::File, &path);
     let directory = entry(
         "folder.png",

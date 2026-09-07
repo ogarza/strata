@@ -537,6 +537,8 @@ fn icons_scrolling_bind_still_requests_thumbnail_and_settle_fills_chrome() {
             super::apply_icons_entry(None, &card, &entry, &HashSet::new(), 64, true);
             assert!(crate::ui::icons_cell::rename_field(&card).is_none());
             let (icon, label) = crate::ui::icons_cell::parts(&card).expect("icons card");
+            let window = gtk::Window::builder().child(&card).build();
+            window.present();
             assert!(label.tooltip_text().is_none());
             assert!(!card.has_css_class("cut"));
             let context = gtk::glib::MainContext::default();
@@ -556,12 +558,15 @@ fn icons_scrolling_bind_still_requests_thumbnail_and_settle_fills_chrome() {
                 64,
                 64,
             );
-            for _ in 0..64 {
-                if !context.iteration(false) {
-                    break;
-                }
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !crate::ui::thumbnail::has_pending_thumbnail(&path) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "visible thumbnail admission"
+                );
+                context.iteration(false);
+                std::thread::sleep(std::time::Duration::from_millis(1));
             }
-            assert!(crate::ui::thumbnail::has_pending_thumbnail(&path));
             let job = crate::ui::thumbnail::pending_thumbnail_id(&path);
             let mut cuts = HashSet::new();
             cuts.insert(entry.location.clone());
@@ -569,6 +574,7 @@ fn icons_scrolling_bind_still_requests_thumbnail_and_settle_fills_chrome() {
             assert_eq!(label.tooltip_text().as_deref(), Some("icons-scroll.png"));
             assert!(card.has_css_class("cut"));
             assert_eq!(crate::ui::thumbnail::pending_thumbnail_id(&path), job);
+            window.destroy();
             crate::ui::thumbnail::clear_thumbnail_runtime();
         },
     );

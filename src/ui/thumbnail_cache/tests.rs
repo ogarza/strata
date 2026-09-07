@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+mod workers;
+
 use std::{
     ffi::OsString,
     os::unix::{

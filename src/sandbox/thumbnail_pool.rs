@@ -1,65 +1,243 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use std::{
+    collections::{HashMap, HashSet},
     os::fd::{AsFd, OwnedFd},
     path::Path,
     process::Child,
-    sync::{Mutex, OnceLock, mpsc},
+    sync::{Arc, Condvar, Mutex, OnceLock, Weak},
     thread,
     time::{Duration, Instant},
 };
 
-use super::{Cancellation, ThumbnailRender, protocol};
+use super::{Cancellation, ThumbnailError, ThumbnailRender, protocol};
 
-const MAX_PERSISTENT_THUMBNAIL_WORKERS: usize = 4;
+pub(crate) const RENDER_LIMIT: usize = 4;
 const SPAWN_BACKOFF: Duration = Duration::from_millis(500);
-#[cfg(not(test))]
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
-#[cfg(test)]
-const IDLE_TIMEOUT: Duration = Duration::from_millis(50);
+const POLL_INTERVAL: Duration = Duration::from_millis(50);
+const MAX_STAGED_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_WORKER_RSS: u64 = 512 * 1024 * 1024;
+const MAX_TOTAL_RSS: u64 = 1024 * 1024 * 1024;
 
-static POOL: OnceLock<Mutex<PoolState>> = OnceLock::new();
+static POOL: OnceLock<Arc<Pool>> = OnceLock::new();
 
-fn pool() -> &'static Mutex<PoolState> {
-    POOL.get_or_init(|| Mutex::new(PoolState::default()))
+fn pool() -> &'static Arc<Pool> {
+    POOL.get_or_init(|| {
+        let pool = Arc::new(Pool::default());
+        let weak = Arc::downgrade(&pool);
+        thread::Builder::new()
+            .name("strata-thumb-retire".to_owned())
+            .spawn(move || {
+                while let Some(pool) = weak.upgrade() {
+                    pool.retire_expired(Instant::now());
+                    let state = pool.state.lock().unwrap_or_else(|p| p.into_inner());
+                    if state.shutdown && state.total == 0 {
+                        break;
+                    }
+                    let _wait = pool.changed.wait_timeout(state, POLL_INTERVAL);
+                }
+            })
+            .expect("thumbnail retirement thread should start");
+        pool
+    })
+}
+
+#[derive(Default)]
+struct Pool {
+    state: Mutex<PoolState>,
+    changed: Condvar,
 }
 
 #[derive(Default)]
 struct PoolState {
-    idle: Vec<WorkerHandle>,
-    workers: Vec<WorkerHandle>,
-    total_workers: usize,
-    next_generation: u64,
-    spawn_backoff_until: Option<Instant>,
+    idle: Vec<(Instant, WorkerRuntime)>,
+    total: usize,
+    generation: u64,
+    staged: u64,
+    rss: HashMap<u64, u64>,
+    backoff: Option<Instant>,
+    shutdown: bool,
 }
 
-#[derive(Clone)]
-struct WorkerHandle {
-    generation: protocol::WorkerGeneration,
-    sender: mpsc::Sender<WorkerCommand>,
+pub(crate) struct ResidentSlot {
+    pool: Weak<Pool>,
+    generation: u64,
 }
 
-enum WorkerCommand {
-    Render(RenderRequest),
-    Retire,
-    Shutdown,
+impl Drop for ResidentSlot {
+    fn drop(&mut self) {
+        if let Some(pool) = self.pool.upgrade() {
+            let mut state = pool.state.lock().unwrap_or_else(|p| p.into_inner());
+            state.total -= 1;
+            state.rss.remove(&self.generation);
+            pool.changed.notify_all();
+        }
+    }
 }
 
-struct RenderRequest {
-    snapshot: OwnedFd,
-    operation: protocol::Operation,
-    requested_edge: u16,
-    cancellation: Cancellation,
-    reply: mpsc::Sender<RenderResult>,
+struct StagingLease {
+    pool: Weak<Pool>,
+    bytes: u64,
 }
 
-struct RenderResult {
-    result: Result<ThumbnailRender, String>,
-    reusable: bool,
+impl Drop for StagingLease {
+    fn drop(&mut self) {
+        if let Some(pool) = self.pool.upgrade() {
+            pool.state.lock().unwrap_or_else(|p| p.into_inner()).staged -= self.bytes;
+            pool.changed.notify_all();
+        }
+    }
 }
 
-struct WorkerReady {
-    handle: WorkerHandle,
+impl Pool {
+    fn check_running(&self) -> Result<(), String> {
+        if self
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .shutdown
+        {
+            Err("Thumbnail pool is shutting down".to_owned())
+        } else {
+            Ok(())
+        }
+    }
+
+    #[cfg(test)]
+    fn reserve(self: &Arc<Self>) -> Result<ResidentSlot, String> {
+        self.reserve_until(Instant::now())
+    }
+
+    fn reserve_until(self: &Arc<Self>, deadline: Instant) -> Result<ResidentSlot, String> {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        loop {
+            if state.shutdown {
+                return Err("Thumbnail pool is shutting down".to_owned());
+            }
+            if state.total < RENDER_LIMIT {
+                break;
+            }
+            if Instant::now() >= deadline {
+                return Err("Thumbnail resident capacity timed out".to_owned());
+            }
+            state = self
+                .changed
+                .wait_timeout(state, POLL_INTERVAL)
+                .unwrap_or_else(|p| p.into_inner())
+                .0;
+        }
+        state.generation = state
+            .generation
+            .checked_add(1)
+            .ok_or("Worker generation exhausted")?;
+        state.total += 1;
+        Ok(ResidentSlot {
+            pool: Arc::downgrade(self),
+            generation: state.generation,
+        })
+    }
+
+    fn checkout(self: &Arc<Self>) -> Result<WorkerRuntime, String> {
+        self.check_running()?;
+        let idle = self
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .idle
+            .pop();
+        if let Some((_, runtime)) = idle {
+            return Ok(runtime);
+        }
+        if self
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .backoff
+            .is_some_and(|until| Instant::now() < until)
+        {
+            return Err("Thumbnail worker spawning is temporarily backed off".to_owned());
+        }
+        let slot = self.reserve_until(Instant::now() + protocol::REQUEST_DEADLINE)?;
+        WorkerRuntime::start(slot).inspect_err(|_| self.note_failure())
+    }
+
+    fn checkin(&self, runtime: WorkerRuntime) {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if state.shutdown {
+            drop(state);
+            drop(runtime);
+        } else {
+            state.idle.push((Instant::now(), runtime));
+            self.changed.notify_all();
+        }
+    }
+
+    fn note_failure(&self) {
+        self.state.lock().unwrap_or_else(|p| p.into_inner()).backoff =
+            Some(Instant::now() + SPAWN_BACKOFF);
+    }
+
+    fn retire_expired(&self, now: Instant) {
+        let expired = {
+            let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            let shutdown = state.shutdown;
+            let mut expired = Vec::new();
+            let mut index = 0;
+            while index < state.idle.len() {
+                if shutdown || now.saturating_duration_since(state.idle[index].0) >= IDLE_TIMEOUT {
+                    expired.push(state.idle.swap_remove(index).1);
+                } else {
+                    index += 1;
+                }
+            }
+            expired
+        };
+        // A resident slot is released only after its process tree has been killed and reaped.
+        drop(expired);
+    }
+
+    fn stage(
+        self: &Arc<Self>,
+        bytes: u64,
+        cancellation: &Cancellation,
+    ) -> Result<StagingLease, String> {
+        if bytes > MAX_STAGED_BYTES {
+            return Err("Thumbnail input exceeds staging budget".to_owned());
+        }
+        let deadline = Instant::now() + protocol::REQUEST_DEADLINE;
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        loop {
+            if state.shutdown || cancellation.is_cancelled() {
+                return Err("Thumbnail staging cancelled".to_owned());
+            }
+            if state.staged + bytes <= MAX_STAGED_BYTES {
+                state.staged += bytes;
+                return Ok(StagingLease {
+                    pool: Arc::downgrade(self),
+                    bytes,
+                });
+            }
+            if Instant::now() >= deadline {
+                return Err("Thumbnail staging budget timed out".to_owned());
+            }
+            state = self
+                .changed
+                .wait_timeout(state, POLL_INTERVAL)
+                .unwrap_or_else(|p| p.into_inner())
+                .0;
+        }
+    }
+
+    fn account_rss(&self, generation: u64, bytes: u64) -> Result<(), String> {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        state.rss.insert(generation, bytes);
+        if bytes > MAX_WORKER_RSS || state.rss.values().copied().sum::<u64>() > MAX_TOTAL_RSS {
+            Err("Thumbnail renderer exceeded its memory budget".to_owned())
+        } else {
+            Ok(())
+        }
+    }
 }
 
 pub(crate) fn render_persistent_thumbnail(
@@ -67,372 +245,266 @@ pub(crate) fn render_persistent_thumbnail(
     operation: protocol::Operation,
     requested_edge: i32,
     cancellation: &Cancellation,
-) -> Result<ThumbnailRender, String> {
-    if cancellation.is_cancelled() {
-        return Err("Preview cancelled".to_owned());
-    }
-    let snapshot = super::sealed_raster_snapshot(path)?;
-    if cancellation.is_cancelled() {
-        return Err("Preview cancelled".to_owned());
-    }
-    let requested_edge = requested_edge.clamp(16, i32::from(protocol::MAX_EDGE)) as u16;
-    let handle = checkout_worker()?;
-    let generation = handle.generation;
-    let (reply, result) = mpsc::channel();
-    let request = RenderRequest {
+) -> Result<ThumbnailRender, ThumbnailError> {
+    let pool = pool();
+    pool.check_running()?;
+    let revision = super::SourceRevision::read(path)?;
+    let _staging = pool.stage(revision.size, cancellation)?;
+    let snapshot = super::sealed_raster_snapshot_checked(path, revision, cancellation)?;
+    let mut runtime = pool.checkout()?;
+    let result = runtime.render(
         snapshot,
         operation,
-        requested_edge,
-        cancellation: cancellation.clone(),
-        reply,
-    };
-    if handle.sender.send(WorkerCommand::Render(request)).is_err() {
-        note_worker_dead(generation);
-        return Err("Thumbnail worker retired before receiving the request".to_owned());
+        requested_edge.clamp(16, i32::from(protocol::MAX_EDGE)) as u16,
+    );
+    match result {
+        Ok(reply) => {
+            pool.checkin(runtime);
+            reply
+        }
+        Err(error) => {
+            pool.note_failure();
+            drop(runtime);
+            Err(error.into())
+        }
     }
-    let result = result
-        .recv_timeout(protocol::REQUEST_DEADLINE + Duration::from_secs(1))
-        .unwrap_or_else(|_| RenderResult {
-            result: Err("The thumbnail worker timed out".to_owned()),
-            reusable: false,
-        });
-    if result.reusable {
-        checkin_worker(handle);
-    } else {
-        note_worker_dead(generation);
-    }
-    result.result
 }
 
-pub(crate) fn retire_idle_thumbnail_worker_for_oneshot() {
-    let worker = {
-        let mut pool = pool().lock().unwrap_or_else(|poison| poison.into_inner());
-        let worker = pool.idle.pop();
-        if let Some(worker) = &worker {
-            pool.workers
-                .retain(|candidate| candidate.generation != worker.generation);
-            pool.total_workers = pool.total_workers.saturating_sub(1);
-        }
-        worker
-    };
-    if let Some(worker) = worker {
-        let _sent = worker.sender.send(WorkerCommand::Retire);
-    }
+pub(crate) fn reserve_oneshot() -> Result<ResidentSlot, String> {
+    let pool = pool();
+    pool.check_running()?;
+    let idle = pool
+        .state
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .idle
+        .pop();
+    drop(idle);
+    pool.reserve_until(Instant::now() + protocol::REQUEST_DEADLINE)
 }
 
 pub(crate) fn shutdown_thumbnail_worker_pool() {
-    let workers = {
-        let mut pool = pool().lock().unwrap_or_else(|poison| poison.into_inner());
-        pool.spawn_backoff_until = None;
-        pool.total_workers = 0;
-        pool.idle.clear();
-        std::mem::take(&mut pool.workers)
-    };
-    for worker in workers {
-        let _sent = worker.sender.send(WorkerCommand::Shutdown);
+    if let Some(pool) = POOL.get() {
+        pool.state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .shutdown = true;
+        pool.changed.notify_all();
     }
 }
 
-fn checkout_worker() -> Result<WorkerHandle, String> {
-    if let Some(worker) = pool()
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner())
-        .idle
-        .pop()
-    {
-        return Ok(worker);
-    }
-    spawn_worker()
-}
-
-fn spawn_worker() -> Result<WorkerHandle, String> {
-    let generation = reserve_generation()?;
-    let (ready, ready_rx) = mpsc::channel();
-    thread::Builder::new()
-        .name("strata-thumbnail-worker".to_owned())
-        .spawn(move || worker_thread(generation, ready))
-        .map_err(|error| {
-            note_worker_dead(generation);
-            format!("Unable to start the thumbnail worker supervisor: {error}")
-        })?;
-    match ready_rx.recv_timeout(protocol::STARTUP_DEADLINE + Duration::from_secs(1)) {
-        Ok(Ok(ready)) => {
-            register_worker(ready.handle.clone());
-            Ok(ready.handle)
-        }
-        Ok(Err(error)) => {
-            note_worker_dead(generation);
-            note_spawn_failure();
-            Err(error)
-        }
-        Err(_) => {
-            note_worker_dead(generation);
-            note_spawn_failure();
-            Err("The thumbnail worker startup timed out".to_owned())
-        }
-    }
-}
-
-fn reserve_generation() -> Result<protocol::WorkerGeneration, String> {
-    let mut pool = pool().lock().unwrap_or_else(|poison| poison.into_inner());
-    if let Some(backoff) = pool.spawn_backoff_until
-        && Instant::now() < backoff
-    {
-        return Err("Thumbnail worker spawning is temporarily backed off".to_owned());
-    }
-    if pool.total_workers >= MAX_PERSISTENT_THUMBNAIL_WORKERS {
-        return Err("No thumbnail worker capacity is available".to_owned());
-    }
-    pool.next_generation = pool.next_generation.saturating_add(1).max(1);
-    let generation = protocol::WorkerGeneration::new(pool.next_generation)
-        .map_err(|_| "Unable to allocate thumbnail worker generation".to_owned())?;
-    pool.total_workers += 1;
-    Ok(generation)
-}
-
-fn register_worker(worker: WorkerHandle) {
-    pool()
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner())
-        .workers
-        .push(worker);
-}
-
-fn checkin_worker(worker: WorkerHandle) {
-    let generation = worker.generation;
-    pool()
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner())
-        .idle
-        .push(worker);
-    thread::spawn(move || {
-        thread::sleep(IDLE_TIMEOUT);
-        retire_idle_worker(generation);
-    });
-}
-
-fn retire_idle_worker(generation: protocol::WorkerGeneration) {
-    let worker = {
-        let mut pool = pool().lock().unwrap_or_else(|poison| poison.into_inner());
-        let Some(index) = pool
-            .idle
-            .iter()
-            .position(|worker| worker.generation == generation)
-        else {
-            return;
-        };
-        let worker = pool.idle.remove(index);
-        pool.workers
-            .retain(|candidate| candidate.generation != worker.generation);
-        pool.total_workers = pool.total_workers.saturating_sub(1);
-        worker
-    };
-    let _sent = worker.sender.send(WorkerCommand::Retire);
-}
-
-fn note_worker_dead(generation: protocol::WorkerGeneration) {
-    let mut pool = pool().lock().unwrap_or_else(|poison| poison.into_inner());
-    pool.idle.retain(|worker| worker.generation != generation);
-    pool.workers
-        .retain(|worker| worker.generation != generation);
-    pool.total_workers = pool.total_workers.saturating_sub(1);
-}
-
-fn note_spawn_failure() {
-    pool()
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner())
-        .spawn_backoff_until = Some(Instant::now() + SPAWN_BACKOFF);
-}
-
-fn worker_thread(
-    generation: protocol::WorkerGeneration,
-    ready: mpsc::Sender<Result<WorkerReady, String>>,
-) {
-    let (sender, receiver) = mpsc::channel();
-    let startup = start_worker(generation, sender.clone());
-    let mut runtime = match startup {
-        Ok(mut runtime) => {
-            if ready
-                .send(Ok(WorkerReady {
-                    handle: WorkerHandle { generation, sender },
-                }))
-                .is_err()
-            {
-                runtime.terminate();
-                return;
-            }
-            runtime
-        }
-        Err(error) => {
-            let _sent = ready.send(Err(error));
-            return;
-        }
-    };
-    loop {
-        match receiver.recv_timeout(IDLE_TIMEOUT) {
-            Ok(WorkerCommand::Render(request)) => {
-                let result = runtime.render(
-                    request.snapshot,
-                    request.operation,
-                    request.requested_edge,
-                    &request.cancellation,
-                );
-                let reusable = result.reusable;
-                let _sent = request.reply.send(result);
-                if !reusable {
-                    runtime.terminate();
-                    return;
-                }
-            }
-            Ok(WorkerCommand::Retire | WorkerCommand::Shutdown)
-            | Err(mpsc::RecvTimeoutError::Disconnected) => {
-                runtime.terminate();
-                return;
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
+struct ChildGuard(Child);
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if !matches!(self.0.try_wait(), Ok(Some(_))) {
+            super::terminate(&mut self.0);
         }
     }
 }
 
 struct WorkerRuntime {
-    child: Child,
+    child: ChildGuard,
     socket: OwnedFd,
     session: protocol::ParentSession,
     generation: protocol::WorkerGeneration,
+    host_start: u64,
     _private_output: super::PrivateOutput,
-}
-
-fn start_worker(
-    generation: protocol::WorkerGeneration,
-    _sender: mpsc::Sender<WorkerCommand>,
-) -> Result<WorkerRuntime, String> {
-    let current_executable = std::env::current_exe()
-        .map_err(|error| format!("Unable to locate the Strata executable: {error}"))?;
-    let running_executable = std::path::PathBuf::from(format!("/proc/{}/exe", std::process::id()));
-    let private_output = super::PrivateOutput::create().map_err(|error| error.to_string())?;
-    let executable = super::resolve_renderer_executable(
-        &current_executable,
-        &running_executable,
-        private_output.path(),
-    )?;
-    let (child, socket) = super::spawn_persistent_thumbnail_worker(&executable)?;
-    protocol::expect_ready(socket.as_fd())
-        .map_err(|error| format!("Thumbnail worker did not become ready: {error:?}"))?;
-    Ok(WorkerRuntime {
-        child,
-        socket,
-        session: protocol::ParentSession::new(generation),
-        generation,
-        _private_output: private_output,
-    })
+    // Declared last: reaping must precede release of resident capacity.
+    slot: ResidentSlot,
 }
 
 impl WorkerRuntime {
+    fn start(slot: ResidentSlot) -> Result<Self, String> {
+        let current = std::env::current_exe().map_err(|error| error.to_string())?;
+        let running = std::path::PathBuf::from(format!("/proc/{}/exe", std::process::id()));
+        let private_output = super::PrivateOutput::create().map_err(|error| error.to_string())?;
+        let executable =
+            super::resolve_renderer_executable(&current, &running, private_output.path())?;
+        Self::start_executable(slot, &executable, private_output)
+    }
+
+    fn start_executable(
+        slot: ResidentSlot,
+        executable: &Path,
+        private_output: super::PrivateOutput,
+    ) -> Result<Self, String> {
+        let (child, socket) = super::spawn_persistent_thumbnail_worker(executable)?;
+        Self::from_child(slot, child, socket, private_output)
+    }
+
+    fn from_child(
+        slot: ResidentSlot,
+        child: Child,
+        socket: OwnedFd,
+        private_output: super::PrivateOutput,
+    ) -> Result<Self, String> {
+        let child = ChildGuard(child);
+        let host_start = process_start(child.0.id())?;
+        protocol::expect_ready(socket.as_fd())
+            .map_err(|error| format!("Thumbnail worker did not become ready: {error:?}"))?;
+        let generation = protocol::WorkerGeneration::new(slot.generation)
+            .map_err(|error| format!("Invalid worker generation: {error:?}"))?;
+        Ok(Self {
+            child,
+            socket,
+            session: protocol::ParentSession::new(generation),
+            generation,
+            host_start,
+            _private_output: private_output,
+            slot,
+        })
+    }
+
+    fn inspect(&mut self) -> Result<(), String> {
+        let pool = self
+            .slot
+            .pool
+            .upgrade()
+            .ok_or("Thumbnail pool disappeared")?;
+        pool.check_running()?;
+        if self
+            .child
+            .0
+            .try_wait()
+            .map_err(|error| error.to_string())?
+            .is_some()
+        {
+            return Err("Thumbnail worker exited".to_owned());
+        }
+        let bytes = process_tree_rss(self.child.0.id(), self.host_start)?;
+        pool.account_rss(self.slot.generation, bytes)
+    }
+
     fn render(
         &mut self,
         snapshot: OwnedFd,
         operation: protocol::Operation,
-        requested_edge: u16,
-        cancellation: &Cancellation,
-    ) -> RenderResult {
-        if cancellation.is_cancelled() {
-            return RenderResult {
-                result: Err("Preview cancelled".to_owned()),
-                reusable: true,
-            };
-        }
-        let request = match self
+        edge: u16,
+    ) -> Result<Result<ThumbnailRender, ThumbnailError>, String> {
+        self.render_until(
+            snapshot,
+            operation,
+            edge,
+            Instant::now() + protocol::REQUEST_DEADLINE,
+        )
+    }
+
+    fn render_until(
+        &mut self,
+        snapshot: OwnedFd,
+        operation: protocol::Operation,
+        edge: u16,
+        deadline: Instant,
+    ) -> Result<Result<ThumbnailRender, ThumbnailError>, String> {
+        self.inspect()?;
+        let request = self
             .session
-            .begin_request(self.generation, operation, requested_edge)
-        {
-            Ok(request) => request,
-            Err(error) => {
-                return RenderResult {
-                    result: Err(format!(
-                        "Unable to prepare thumbnail worker request: {error:?}"
-                    )),
-                    reusable: false,
-                };
-            }
-        };
-        if let Err(error) = protocol::send_packet(
+            .begin_request(self.generation, operation, edge)
+            .map_err(|error| format!("Invalid worker session: {error:?}"))?;
+        protocol::send_packet(
             self.socket.as_fd(),
             request,
             &[snapshot.as_fd()],
-            protocol::REQUEST_DEADLINE,
-        ) {
-            return RenderResult {
-                result: Err(format!(
-                    "Unable to send thumbnail worker request: {error:?}"
-                )),
-                reusable: false,
-            };
-        }
-        let packet = match protocol::recv_packet(self.socket.as_fd(), protocol::REQUEST_DEADLINE, 1)
-        {
-            Ok(packet) => packet,
-            Err(error) => {
-                return RenderResult {
-                    result: Err(format!(
-                        "Unable to receive thumbnail worker reply: {error:?}"
-                    )),
-                    reusable: false,
-                };
+            POLL_INTERVAL,
+        )
+        .map_err(|error| format!("Unable to send thumbnail request: {error:?}"))?;
+        let packet = loop {
+            self.inspect()?;
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err("Thumbnail worker timed out".to_owned());
+            }
+            match protocol::recv_reply_packet(self.socket.as_fd(), remaining.min(POLL_INTERVAL)) {
+                Ok(packet) => break packet,
+                Err(protocol::ProtocolError::Timeout) => continue,
+                Err(error) => return Err(format!("Unable to receive thumbnail reply: {error:?}")),
             }
         };
-        match self.session.accept_reply(packet) {
-            Ok(protocol::JobReply::Success(output)) => {
+        self.inspect()?;
+        match self
+            .session
+            .accept_reply(packet)
+            .map_err(|error| format!("Invalid thumbnail reply: {error:?}"))?
+        {
+            protocol::JobReply::JobFailure(_) => Ok(Err(ThumbnailError::Content)),
+            protocol::JobReply::Success(output) => {
                 let metadata = output.metadata();
-                RenderResult {
-                    result: output
-                        .read_all()
-                        .map(|pixels| ThumbnailRender::Raw {
-                            pixels,
-                            width: i32::from(metadata.width),
-                            height: i32::from(metadata.height),
-                            stride: usize::try_from(metadata.stride)
-                                .expect("validated thumbnail stride"),
-                        })
-                        .map_err(|error| {
-                            format!("Unable to read thumbnail worker output: {error:?}")
-                        }),
-                    reusable: true,
+                if metadata.representation != protocol::Representation::Rgba8 {
+                    return Err("Worker returned an unsupported representation".to_owned());
                 }
+                let pixels = output
+                    .read_all()
+                    .map_err(|error| format!("Invalid thumbnail output: {error:?}"))?;
+                Ok(Ok(ThumbnailRender::Raw {
+                    pixels,
+                    width: i32::from(metadata.width),
+                    height: i32::from(metadata.height),
+                    stride: metadata.stride as usize,
+                }))
             }
-            Ok(protocol::JobReply::JobFailure(_)) => RenderResult {
-                result: Err("The thumbnail worker could not decode the image".to_owned()),
-                reusable: true,
-            },
-            Err(error) => RenderResult {
-                result: Err(format!("Invalid thumbnail worker reply: {error:?}")),
-                reusable: false,
-            },
         }
     }
+}
 
-    fn terminate(&mut self) {
-        super::terminate(&mut self.child);
+fn process_start(pid: u32) -> Result<u64, String> {
+    let stat =
+        std::fs::read_to_string(format!("/proc/{pid}/stat")).map_err(|error| error.to_string())?;
+    stat.rsplit_once(')')
+        .and_then(|(_, fields)| fields.split_whitespace().nth(19))
+        .and_then(|value| value.parse().ok())
+        .ok_or_else(|| "Invalid process identity".to_owned())
+}
+
+fn process_tree_rss(root: u32, start: u64) -> Result<u64, String> {
+    if process_start(root)? != start {
+        return Err("Renderer process identity changed".to_owned());
     }
+    let mut pending = vec![root];
+    let mut visited = HashSet::new();
+    let mut bytes = 0u64;
+    while let Some(pid) = pending.pop() {
+        if !visited.insert(pid) {
+            continue;
+        }
+        if visited.len() > 64 {
+            return Err("Too many renderer descendants".to_owned());
+        }
+        let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
+            if pid == root {
+                return Err("Renderer disappeared".to_owned());
+            }
+            continue;
+        };
+        let rss = status
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("VmRSS:")
+                    .and_then(|v| v.split_whitespace().next())
+                    .and_then(|v| v.parse::<u64>().ok())
+            })
+            .unwrap_or(0);
+        bytes = bytes.saturating_add(rss.saturating_mul(1024));
+        let tasks =
+            std::fs::read_dir(format!("/proc/{pid}/task")).map_err(|error| error.to_string())?;
+        for (index, task) in tasks.enumerate() {
+            if index >= 128 {
+                return Err("Too many renderer threads".to_owned());
+            }
+            let task = task.map_err(|error| error.to_string())?;
+            if let Ok(children) = std::fs::read_to_string(task.path().join("children")) {
+                pending.extend(
+                    children
+                        .split_whitespace()
+                        .filter_map(|pid| pid.parse::<u32>().ok()),
+                );
+            }
+        }
+    }
+    if process_start(root)? != start {
+        return Err("Renderer process identity changed".to_owned());
+    }
+    Ok(bytes)
 }
 
 #[cfg(test)]
-pub(crate) fn idle_worker_count() -> usize {
-    pool()
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner())
-        .idle
-        .len()
-}
-
-#[cfg(test)]
-pub(crate) fn total_worker_count() -> usize {
-    pool()
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner())
-        .total_workers
-}
-
-#[cfg(test)]
-#[path = "thumbnail_pool/tests.rs"]
 mod tests;

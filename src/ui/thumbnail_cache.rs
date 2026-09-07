@@ -29,6 +29,7 @@ const MAX_DISK_THUMBNAIL_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_CACHED_DIMENSION: u32 = 512;
 const MAX_CACHED_PIXELS: u64 = 512 * 512;
 /// Only guards the normalization decode against absurd inputs.
+#[cfg(test)]
 const MAX_RENDER_BYTES: usize = 32 * 1024 * 1024;
 
 pub fn lookup(path: &Path, mtime: i64) -> Option<Vec<u8>> {
@@ -49,6 +50,7 @@ pub fn lookup(path: &Path, mtime: i64) -> Option<Vec<u8>> {
 }
 
 /// Best effort: failures are silently dropped. Only rendered bytes reach here, so nothing writes negative-cache files.
+#[cfg(test)]
 pub fn store(path: &Path, mtime: i64, png: &[u8]) {
     if png.is_empty() || png.len() > MAX_RENDER_BYTES {
         return;
@@ -66,6 +68,63 @@ pub fn store(path: &Path, mtime: i64, png: &[u8]) {
         return;
     };
     let _ignored = crate::storage::atomic_write(&dir.join(name), &tagged);
+}
+
+pub(super) fn lookup_revision(
+    path: &Path,
+    revision: crate::sandbox::SourceRevision,
+) -> Option<Vec<u8>> {
+    let png = lookup(path, revision.modified)?;
+    if read_text_tag(&png, b"Strata::Revision").is_some_and(|stamp| stamp != revision.cache_stamp())
+    {
+        return None;
+    }
+    revision.matches(path).then_some(png)
+}
+
+pub(super) fn store_render(
+    path: &Path,
+    revision: crate::sandbox::SourceRevision,
+    render: &crate::sandbox::ThumbnailRender,
+) {
+    if !revision.matches(path) {
+        return;
+    }
+    let Some((uri, name)) = cache_key(path) else {
+        return;
+    };
+    let Some(dir) = shared_cache_dir() else {
+        return;
+    };
+    let tagged = match render {
+        crate::sandbox::ThumbnailRender::Png(png) => {
+            normalize_with_revision(png, &uri, revision.modified, Some(revision))
+        }
+        crate::sandbox::ThumbnailRender::Raw {
+            pixels,
+            width,
+            height,
+            stride,
+        } => {
+            let bytes = gtk::glib::Bytes::from_owned(pixels.clone());
+            let pixbuf = gtk::gdk_pixbuf::Pixbuf::from_bytes(
+                &bytes,
+                gtk::gdk_pixbuf::Colorspace::Rgb,
+                true,
+                8,
+                *width,
+                *height,
+                *stride as i32,
+            );
+            encode_canonical_pixbuf(pixbuf, &uri, revision.modified, Some(revision))
+        }
+    };
+    if let Ok(tagged) = tagged
+        && revision.matches(path)
+        && ensure_cache_dir(&dir).is_ok()
+    {
+        let _ignored = crate::storage::atomic_write(&dir.join(name), &tagged);
+    }
 }
 
 /// The digest is only a file name, where MD5's weakness is irrelevant; GLib keeps keys matching other spec-following applications.
@@ -166,7 +225,17 @@ fn read_bounded(path: &Path) -> Option<Vec<u8>> {
 }
 
 /// The output always has a maximum edge of 256 px, so a tiny view can never poison the shared bucket.
+#[cfg(test)]
 fn normalize_to_canonical(png: &[u8], uri: &str, mtime: i64) -> Result<Vec<u8>, String> {
+    normalize_with_revision(png, uri, mtime, None)
+}
+
+fn normalize_with_revision(
+    png: &[u8],
+    uri: &str,
+    mtime: i64,
+    revision: Option<crate::sandbox::SourceRevision>,
+) -> Result<Vec<u8>, String> {
     use gtk::gdk_pixbuf::prelude::PixbufLoaderExt;
     let loader = gtk::gdk_pixbuf::PixbufLoader::new();
     loader.write(png).map_err(|error| error.to_string())?;
@@ -174,6 +243,15 @@ fn normalize_to_canonical(png: &[u8], uri: &str, mtime: i64) -> Result<Vec<u8>, 
     let pixbuf = loader
         .pixbuf()
         .ok_or_else(|| "thumbnail decoded to no image".to_owned())?;
+    encode_canonical_pixbuf(pixbuf, uri, mtime, revision)
+}
+
+fn encode_canonical_pixbuf(
+    pixbuf: gtk::gdk_pixbuf::Pixbuf,
+    uri: &str,
+    mtime: i64,
+    revision: Option<crate::sandbox::SourceRevision>,
+) -> Result<Vec<u8>, String> {
     let (width, height) = (pixbuf.width(), pixbuf.height());
     if width <= 0 || height <= 0 {
         return Err("thumbnail decoded to empty dimensions".to_owned());
@@ -193,14 +271,14 @@ fn normalize_to_canonical(png: &[u8], uri: &str, mtime: i64) -> Result<Vec<u8>, 
             )
             .ok_or_else(|| "thumbnail scaling failed".to_owned())?
     };
+    let mtime = mtime.to_string();
+    let stamp = revision.map(|revision| revision.cache_stamp());
+    let mut options = vec![("tEXt::Thumb::URI", uri), ("tEXt::Thumb::MTime", &mtime)];
+    if let Some(stamp) = &stamp {
+        options.push(("tEXt::Strata::Revision", stamp));
+    }
     pixbuf
-        .save_to_bufferv(
-            "png",
-            &[
-                ("tEXt::Thumb::URI", uri),
-                ("tEXt::Thumb::MTime", &mtime.to_string()),
-            ],
-        )
+        .save_to_bufferv("png", &options)
         .map_err(|error| error.to_string())
         .map(|bytes| bytes.to_vec())
 }
@@ -231,12 +309,18 @@ fn png_dimensions(png: &[u8]) -> Option<(u32, u32)> {
 
 /// Never panics on hostile input: the shared cache is world-writable data.
 fn read_thumb_tags(png: &[u8]) -> Option<(String, String)> {
+    Some((
+        read_text_tag(png, b"Thumb::URI")?,
+        read_text_tag(png, b"Thumb::MTime")?,
+    ))
+}
+
+fn read_text_tag(png: &[u8], expected: &[u8]) -> Option<String> {
     const SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
     if png.get(..SIGNATURE.len())? != SIGNATURE {
         return None;
     }
-    let mut uri = None;
-    let mut mtime = None;
+    let mut result = None;
     let mut position = SIGNATURE.len();
     while position.checked_add(8)? <= png.len() {
         let length = u32::from_be_bytes(png.get(position..position + 4)?.try_into().ok()?) as usize;
@@ -249,10 +333,8 @@ fn read_thumb_tags(png: &[u8]) -> Option<(String, String)> {
             let data = &png[position + 8..data_end];
             if let Some(nul) = data.iter().position(|byte| *byte == 0) {
                 let (keyword, value) = (&data[..nul], &data[nul + 1..]);
-                if keyword == b"Thumb::URI" {
-                    uri = std::str::from_utf8(value).ok().map(str::to_owned);
-                } else if keyword == b"Thumb::MTime" {
-                    mtime = std::str::from_utf8(value).ok().map(str::to_owned);
+                if keyword == expected {
+                    result = std::str::from_utf8(value).ok().map(str::to_owned);
                 }
             }
         }
@@ -261,5 +343,5 @@ fn read_thumb_tags(png: &[u8]) -> Option<(String, String)> {
         }
         position = data_end + 4;
     }
-    Some((uri?, mtime?))
+    result
 }

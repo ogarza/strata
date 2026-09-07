@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#[path = "tests/workers.rs"]
+mod workers;
+
 use std::{
     sync::{
         Arc, Condvar, Mutex,
@@ -73,13 +76,13 @@ fn executor_bounds_running_and_queued_decodes() {
 }
 
 #[test]
-fn raw_rgba_pixels_become_a_texture_and_persistable_png() {
-    let (decoded, png) = decode_raw(vec![255, 0, 0, 255, 0, 255, 0, 128], 2, 1, 8)
+fn raw_rgba_pixels_become_a_texture_without_png_encoding() {
+    let decoded = decode_raw(vec![255, 0, 0, 255, 0, 255, 0, 128], 2, 1, 8)
         .expect("raw pixels should decode");
     assert_eq!(decoded.texture.width(), 2);
     assert_eq!(decoded.texture.height(), 1);
     assert_eq!(decoded.byte_len, 8);
-    assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
+    assert_eq!(decoded.texture.format(), gdk::MemoryFormat::R8g8b8a8);
 }
 
 #[test]

@@ -51,6 +51,7 @@ pub(crate) fn run_thumbnail_worker(control: BorrowedFd<'_>) -> Result<(), String
         ) {
             Ok(packet) => packet,
             Err(crate::sandbox::protocol::ProtocolError::PeerClosed) => return Ok(()),
+            Err(crate::sandbox::protocol::ProtocolError::Timeout) => continue,
             Err(error) => return Err(format!("Invalid thumbnail worker request: {error:?}")),
         };
         let request = crate::sandbox::protocol::validate_snapshot_request(packet)
@@ -62,15 +63,21 @@ pub(crate) fn run_thumbnail_worker(control: BorrowedFd<'_>) -> Result<(), String
         let input_path = PathBuf::from(format!("/proc/self/fd/{}", input.as_raw_fd()));
         let result = match request.operation {
             crate::sandbox::protocol::Operation::ThumbnailPng => {
-                render_pixbuf(&input_path, i32::from(request.requested_edge))
+                gdk_pixbuf::Pixbuf::from_file_at_scale(
+                    &input_path,
+                    i32::from(request.requested_edge),
+                    i32::from(request.requested_edge),
+                    true,
+                )
+                .map_err(|error| error.to_string())
+                .and_then(|pixbuf| rgba_pixbuf(&pixbuf))
             }
             crate::sandbox::protocol::Operation::ThumbnailPdf => {
-                render_pdf_thumbnail(&input_path, i32::from(request.requested_edge))
+                render_pdf_thumbnail_pixels(&input_path, i32::from(request.requested_edge))
             }
         };
         match result {
-            Ok(png) => {
-                let (pixels, width, height, stride) = rgba_pixels(&png)?;
+            Ok((pixels, width, height, stride)) => {
                 let output =
                     crate::sandbox::protocol::sealed_memfd("strata-thumbnail-output", &pixels)
                         .map_err(|error| {
@@ -146,15 +153,7 @@ pub(crate) fn run(arguments: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn rgba_pixels(data: &[u8]) -> Result<(Vec<u8>, u16, u16, u32), String> {
-    let loader = gdk_pixbuf::PixbufLoader::new();
-    loader
-        .write(data)
-        .and_then(|()| loader.close())
-        .map_err(|error| error.to_string())?;
-    let pixbuf = loader
-        .pixbuf()
-        .ok_or_else(|| "Thumbnail worker produced no pixels".to_owned())?;
+fn rgba_pixbuf(pixbuf: &gdk_pixbuf::Pixbuf) -> Result<(Vec<u8>, u16, u16, u32), String> {
     let width = u16::try_from(pixbuf.width()).map_err(|_| "thumbnail width overflowed")?;
     let height = u16::try_from(pixbuf.height()).map_err(|_| "thumbnail height overflowed")?;
     let channels = pixbuf.n_channels();
@@ -316,6 +315,49 @@ fn render_pdf_thumbnail(path: &Path, size: i32) -> Result<Vec<u8>, String> {
     )
 }
 
+fn render_pdf_thumbnail_pixels(path: &Path, size: i32) -> Result<(Vec<u8>, u16, u16, u32), String> {
+    let uri = gio::File::for_path(path).uri();
+    let document = poppler::Document::from_file(&uri, None).map_err(|error| error.to_string())?;
+    let page = document
+        .page(0)
+        .ok_or_else(|| "This PDF has no pages".to_owned())?;
+    let mut surface = pdf_surface(
+        &page,
+        f64::from(size),
+        f64::from(size),
+        f64::from(size * size),
+    )?;
+    let width = surface.width() as u16;
+    let height = surface.height() as u16;
+    let source_stride = surface.stride() as usize;
+    let stride = u32::from(width) * 4;
+    let mut pixels = vec![0; stride as usize * usize::from(height)];
+    let data = surface.data().map_err(|error| error.to_string())?;
+    for y in 0..usize::from(height) {
+        for x in 0..usize::from(width) {
+            let offset = y * source_stride + x * 4;
+            let argb = u32::from_ne_bytes(data[offset..offset + 4].try_into().expect("ARGB pixel"));
+            let alpha = (argb >> 24) as u8;
+            let unpremultiply = |channel: u8| -> u8 {
+                if alpha == 0 {
+                    0
+                } else {
+                    ((u32::from(channel) * 255 + u32::from(alpha) / 2) / u32::from(alpha)).min(255)
+                        as u8
+                }
+            };
+            let offset = y * stride as usize + x * 4;
+            pixels[offset..offset + 4].copy_from_slice(&[
+                unpremultiply((argb >> 16) as u8),
+                unpremultiply((argb >> 8) as u8),
+                unpremultiply(argb as u8),
+                alpha,
+            ]);
+        }
+    }
+    Ok((pixels, width, height, stride))
+}
+
 fn render_pdf_page(path: &Path, requested_page: i32) -> Result<(Vec<u8>, i32, i32), String> {
     let uri = gio::File::for_path(path).uri();
     let document = poppler::Document::from_file(&uri, None).map_err(|error| error.to_string())?;
@@ -337,6 +379,20 @@ fn render_pdf_surface(
     max_height: f64,
     max_pixels: f64,
 ) -> Result<Vec<u8>, String> {
+    let surface = pdf_surface(page, max_width, max_height, max_pixels)?;
+    let mut png = Vec::new();
+    surface
+        .write_to_png(&mut png)
+        .map_err(|error| error.to_string())?;
+    Ok(png)
+}
+
+fn pdf_surface(
+    page: &poppler::Page,
+    max_width: f64,
+    max_height: f64,
+    max_pixels: f64,
+) -> Result<cairo::ImageSurface, String> {
     let (page_width, page_height) = page.size();
     if page_width <= 0.0 || page_height <= 0.0 {
         return Err("The PDF page has invalid dimensions".to_owned());
@@ -351,11 +407,7 @@ fn render_pdf_surface(
     context.scale(scale, scale);
     page.render(&context);
     surface.flush();
-    let mut png = Vec::new();
-    surface
-        .write_to_png(&mut png)
-        .map_err(|error| error.to_string())?;
-    Ok(png)
+    Ok(surface)
 }
 
 fn bounded_surface_dimensions(

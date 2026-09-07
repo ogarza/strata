@@ -1,5 +1,170 @@
 # Thumbnail performance
 
+## Viewport-first scheduling (R2, issue #516)
+
+Thumbnail admission now uses allocated widget geometry, not just GTK bind order.
+Mapped thumbnails intersecting the viewport take priority over a nearby prefetch
+band extending 25% of its width/height beyond each edge. More distant, unmapped,
+and unallocated targets stay parked without lookup or render work. Nested scroll
+containers are all checked, including horizontal clipping in Columns.
+
+- Binding records interest and schedules one coalesced low-priority main-context
+  pump. Geometry inspection never runs inside factory bind or adjustment handlers.
+  Adjustment changes pause new admission until a coalesced frame update permits
+  the pump to inspect freshly allocated bounds. Temporary pauses retain queued
+  lookup/render progress rather than restarting source lookup. Offscreen parks do not poll;
+  scrolling, layout, mapping, or a completion wakes the scheduler.
+- At most two source lookups are submitted at a time, matching the two lookup
+  threads. The remaining work stays in a reorderable GTK-local queue. Visibility
+  is checked again at lookup and render dispatch. An offscreen queued request is
+  returned to its live consumers' parked state; a visible request can displace
+  queued prefetch work when the 64-entry unique-request table is full. Prefetch
+  renders also wait for visible source lookups to resolve, so they cannot occupy
+  every renderer just before those visible misses become ready.
+- The best eligible tier wins, with FIFO ordering inside that tier and the
+  existing three-raster burst before eligible heavy work **within the same tier**.
+  Total renders remain at most four, including at most one heavy render. A busy
+  heavy lane does not prevent useful raster work. Already-dispatched executions
+  retain their IDs, permits, revision validation, and reattachment opportunities;
+  scrolling never kills a worker to free capacity.
+- Icons/List retain the existing 80 ms quiet-period bind gate. It also pauses
+  admission of already-parked requests for that viewport; another window's idle
+  viewport can continue. Same-file texture preservation from R1 is unchanged.
+
+### Queue and visible-paint measurements
+
+`LookupWait` and `RenderWait` stage samples measure from admission to the relevant
+queue until its worker starts, separately from `Lookup`/`Render` service time.
+They exclude time parked before queue admission and reset when a request is
+re-admitted. They are not end-to-end bind latency.
+
+With `RUST_LOG=strata::metrics=debug`, `thumbnail post-settle viewport painted`
+records `viewport_id`, `epoch`, `milestone` (`first` / `ninety_percent`), `total`,
+`ready`, and `elapsed_micros`. Icons/List start a fresh epoch at each scroll
+adjustment; elapsed time includes the 80 ms gate. A fixed cohort of visible
+thumbnail targets is captured at the first post-settle GTK after-paint callback;
+prefetch targets are excluded. Existing same-file textures count as ready. Failed,
+removed, or rebound cohort members cannot falsely satisfy the 90% threshold;
+a later scroll starts a new cohort. Initial viewport registration also starts an
+epoch, but other modes do not have the Icons/List scroll-epoch gate.
+
+These are **post-settle GTK paint observations**, not compositor presentation
+latency or the first instant an already-present texture became visible during a
+fling. The 90% target rounds up. Empty cohorts report neither milestone. Paint
+sampling stops at 90% and is disabled unless metrics debug logging is enabled;
+callbacks are detached on unmap. Compare identical viewports, fixture sets,
+build profiles, and logging levels. Regression-test timings are not benchmarks.
+
+This diff does not change source isolation, cache identity, rendering/persistence,
+RAM-before-disk ordering, or the texture-completion lane. Those last two latency
+optimizations remain separate follow-ups. No measured speedup is claimed yet.
+
+### Manual acceptance for R2
+
+Use the disposable fixture/XDG setup below and the newly built binary. In Icons
+and List, fling several screens forward and backward, stop, and repeat; include
+warm-RAM and warm-disk restarts. The currently visible rows should fill before
+nearby prefetch, without same-file fallback flashes or wrong-file row reuse.
+Repeat with two windows, continuously scrolling one while leaving the other idle,
+and with mixed images/PDFs. Check Columns horizontal scrolling and icon-size/view
+changes for stranded thumbnails. Recheck source deletion/corruption and custom
+icons. Capture a short before/after video and, optionally, the metrics above from
+identical disposable fixtures; do not expose private paths or images.
+
+Cleanup removes only the disposable fixture/XDG roots. Roll back only R2 changes
+relative to the preserved R1 worktree, not the whole uncommitted correction stack;
+never clear personal thumbnail caches.
+
+## Review corrections (R1, issue #516)
+
+The current implementation corrects the lifecycle and scheduling defects found
+in the D00–D11 stack. The numbered sections below are delivery history; this
+section describes the corrected execution model, with R2 admission updates above.
+
+- Two lookup/decode threads, four render/supervision threads, and one persistence
+  thread have separate bounded queues. A slow renderer or PNG persistence cannot
+  occupy lookup capacity. The four render permits include heavy work (at most
+  one RAW/PDF/video execution) and one-shot thumbnail backends.
+- Executing requests retain their execution IDs and deduplication entries when
+  the last consumer leaves. Rebinding attaches to the same resolved revision;
+  queued requests without consumers are removed. Stale completions cannot release
+  a replacement execution's permit. Same-file rebinds keep the displayed texture
+  during asynchronous revalidation, and Icons/List scroll-deferred binds keep it
+  without starting work. Different-file binds, custom icons, and non-thumbnail
+  entries replace it immediately. Failed revalidation clears the retained image;
+  stale failures cannot clear a recycled row's new thumbnail.
+- The pool has one retirement thread, not one sleeping thread per completion.
+  Its 30-second idle deadline is measured from the latest check-in. The helper
+  waits for new requests until peer closure; a request deadline is not an idle
+  timeout. Zero-FD content-failure replies leave the helper reusable.
+- RAII cleanup kills/reaps failed startups and retired workers before releasing
+  their resident slots. One-shot transitions likewise reap an idle helper before
+  taking its slot. Startup and runtime failures enter a shared 500 ms spawn
+  backoff; service failures are not put in the content-failure cache. Shutdown
+  wakes retirement and is checked by active render supervision, without waiting
+  on GTK.
+- Supervision checks the host bwrap PID's start time and sums RSS across its
+  descendant processes, including children launched by non-main threads. It
+  samples during requests and after replies, retiring on measurement errors or
+  excess: 512 MiB per worker tree, 1 GiB summed reported RSS. Source snapshots
+  have a separate 512 MiB aggregate staging budget. RSS is sampled, not a cgroup
+  hard limit; it does not include every shared/tmpfs backing page. Existing AS,
+  file-size, and per-sandbox tmpfs limits remain in force.
+- Source identity includes device/inode, size, and nanosecond mtime/ctime. Metadata
+  supplied by the browser is a hint, not authoritative. Source resolution runs
+  off GTK before RAM reuse; resident hits still reuse textures without decoding
+  or spawning. Render, decode completion, and persistence revalidate the revision
+  and pathname; staging checks both the opened FD and the pathname. These checks
+  detect changes, not atomicity against arbitrary concurrent filesystem writes.
+  Slow filesystem syscalls themselves cannot be interrupted by the copy-loop
+  deadline; they stay on bounded background threads.
+- Persisted thumbnails retain Freedesktop URI/mtime tags and add `Strata::Revision`
+  so Strata rejects its own same-second stale entries. Foreign cache entries
+  without that extension retain Freedesktop whole-second validation semantics.
+- Protocol version 2 requires raw RGBA8 replies in the production pool. Raster
+  pixbufs and Cairo PDF surfaces normalize directly to pixels without an internal
+  PNG round trip. UI completion constructs a texture without PNG encoding;
+  persistence alone encodes the tagged PNG. Shared-cache PNG parsing remains
+  parent-side under the previously accepted S3 limitation.
+
+### Required regression coverage
+
+CI builds the actual application and requires the real-bwrap regression test;
+missing bubblewrap, namespace support, or the specified executable is a failure.
+The real test covers decode-failure recovery, repeated raster/PDF rendering in
+one worker, reuse after more than 12 seconds idle, and idle retirement. Adjacent
+unit tests cover heavy-only scheduling, active reattachment, stale permit release,
+separate execution lanes, failed-readiness reaping, shutdown/deadlines without
+GTK progress, staging/RSS bounds, source changes, and raw cache persistence.
+
+```bash
+cargo build --all-features
+xvfb-run -a env -u WAYLAND_DISPLAY GDK_BACKEND=x11 \
+  GTK_A11Y=none NO_AT_BRIDGE=1 STRATA_REQUIRE_GTK_TESTS=1 \
+  STRATA_REQUIRE_SANDBOX_TESTS=1 STRATA_TEST_EXECUTABLE="$PWD/target/debug/strata" \
+  cargo test --all-targets --all-features
+```
+
+Without the executable variable, ordinary developer test runs explicitly report
+the real-worker capability skip. Such a run does not substitute for this gate.
+
+### Manual acceptance for R1
+
+Use the disposable fixture/XDG setup below. Open a cold mixed folder and a
+PDF-only folder; navigate away/back during work and switch windows/view sizes.
+Expect no thumbnail→fallback→thumbnail flash when scrolling/rebinding the same
+file, no previous-file thumbnail on recycled rows, no duplicate/wrong-row results,
+at most four active renders and one heavy
+render, stable helper PIDs, and prompt warm-cache results while renderers are
+busy. Include a corrupt image followed by a valid image, revisit after 15 seconds
+idle, then wait over 30 seconds after the last job and verify idle helpers exit.
+Replace a fixture while work is pending and confirm its new thumbnail/cache
+revision wins. Compare transparent/colorful images and PDF output, restart with
+warm disk cache, and exit during rendering. Delete only the disposable fixture
+and XDG roots afterward; do not clear personal thumbnail caches.
+
+No performance improvement is claimed without a new owner-run comparison.
+
 ## D00 baseline observability
 
 This document records the baseline instrumentation for issue #516. D00 does not

@@ -2,7 +2,7 @@
 
 use std::{
     cell::{Cell, RefCell},
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
@@ -18,21 +18,22 @@ use crate::{
 #[path = "thumbnail_decode.rs"]
 mod decode;
 mod slot;
+mod viewport;
 pub(crate) use slot::ThumbnailSlot;
+use viewport::Priority;
 
 static NEXT_REQUEST: AtomicU64 = AtomicU64::new(1);
 const MAX_CACHE_ENTRIES: usize = 256;
 const MAX_CACHE_BYTES: usize = 64 * 1024 * 1024;
 /// One process-wide bound covers raster, heavy, and one-shot fallback renders.
-const MAX_THUMBNAIL_WORKERS: usize = 4;
+const MAX_THUMBNAIL_WORKERS: usize = crate::sandbox::RENDER_LIMIT;
 const MAX_QUEUED_THUMBNAILS: usize = 64;
+const MAX_LOOKUP_DISPATCH: usize = 2;
 const FAILED_THUMBNAIL_TTL: Duration = Duration::from_secs(30);
 /// Scroll callbacks re-arm this delay so leftover parks are not fired inside layout.
 const THUMBNAIL_SETTLE_DELAY: Duration = Duration::from_millis(120);
 /// Overlong parks still admit sandbox jobs on a long fling.
 const MAX_SETTLE_WAIT: Duration = Duration::from_millis(400);
-#[cfg(test)]
-const VIEWPORT_OVERSCAN: f32 = 0.25;
 const MAX_HEAVY_THUMBNAILS: usize = 1;
 const MAX_RASTER_BURST: usize = 3;
 
@@ -43,6 +44,8 @@ thread_local! {
         RefCell::new(HashMap::new());
     static THUMBNAIL_QUEUE: RefCell<ThumbnailQueue> = RefCell::new(ThumbnailQueue::default());
     static LOOKUP_QUEUE: RefCell<VecDeque<ThumbnailKey>> = const { RefCell::new(VecDeque::new()) };
+    static LOOKUP_ACTIVE: RefCell<HashSet<u64>> = RefCell::new(HashSet::new());
+    static PIPELINE_PUMP: RefCell<Option<glib::SourceId>> = const { RefCell::new(None) };
     static THUMBNAIL_CACHE: RefCell<ThumbnailCache> = RefCell::new(ThumbnailCache::default());
     /// Per-viewport settle groups (key zero is the fallback); one view's fling never postpones another's.
     static SETTLE_VIEWS: RefCell<HashMap<usize, ViewSettle>> = RefCell::new(HashMap::new());
@@ -89,6 +92,10 @@ struct SettledPark {
 }
 
 struct ViewSettle {
+    id: u64,
+    scrolling: bool,
+    frame_pending: bool,
+    paint: viewport::PaintProgress,
     viewport: glib::WeakRef<gtk::ScrolledWindow>,
     pending: Vec<SettledPark>,
     timer: Option<glib::SourceId>,
@@ -99,8 +106,8 @@ struct ViewSettle {
 #[derive(Clone)]
 struct PersistJob {
     path: PathBuf,
-    mtime: i64,
-    png: Vec<u8>,
+    revision: crate::sandbox::SourceRevision,
+    render: crate::sandbox::ThumbnailRender,
 }
 
 /// Bounded: slow disk never delays display; over capacity the oldest entry drops.
@@ -143,11 +150,19 @@ impl PersistQueue {
 static PERSIST_QUEUE: std::sync::Mutex<PersistQueue> = std::sync::Mutex::new(PersistQueue::new());
 static PERSIST_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-fn enqueue_persist(path: PathBuf, mtime: i64, png: Vec<u8>) {
+fn enqueue_persist(
+    path: PathBuf,
+    revision: crate::sandbox::SourceRevision,
+    render: crate::sandbox::ThumbnailRender,
+) {
     PERSIST_QUEUE
         .lock()
         .unwrap_or_else(|poison| poison.into_inner())
-        .push(PersistJob { path, mtime, png });
+        .push(PersistJob {
+            path,
+            revision,
+            render,
+        });
     pump_persist_queue();
 }
 
@@ -165,10 +180,14 @@ fn pump_persist_queue() {
         return;
     };
     let work_job = job.clone();
-    if decode::submit_owned(
+    if decode::submit_persist(
         move || {
             let started = std::time::Instant::now();
-            super::thumbnail_cache::store(&work_job.path, work_job.mtime, &work_job.png);
+            super::thumbnail_cache::store_render(
+                &work_job.path,
+                work_job.revision,
+                &work_job.render,
+            );
             crate::metrics::record_thumbnail_stage(
                 crate::metrics::ThumbnailStage::Persist,
                 started.elapsed(),
@@ -191,7 +210,9 @@ fn pump_persist_queue() {
 }
 
 struct PendingThumbnail {
+    queued_at: Instant,
     id: u64,
+    executing: bool,
     kind: ThumbnailKind,
     cancellation: Cancellation,
     targets: Vec<PendingTarget>,
@@ -213,6 +234,7 @@ struct LookupResult {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct ThumbnailKey {
     path: PathBuf,
+    revision: Option<crate::sandbox::SourceRevision>,
     modified: Option<i64>,
     file_size: Option<u64>,
 }
@@ -309,6 +331,7 @@ struct ThumbnailQueue {
     raster_burst: usize,
     queued: VecDeque<(ThumbnailKey, ThumbnailKind)>,
     active_kinds: HashMap<ThumbnailKey, ThumbnailKind>,
+    active_ids: HashMap<ThumbnailKey, u64>,
 }
 
 impl ThumbnailQueue {
@@ -325,12 +348,34 @@ impl ThumbnailQueue {
         true
     }
 
+    #[cfg(test)]
     fn begin_next(&mut self) -> Option<ThumbnailKey> {
+        self.begin_next_prioritized(|_| Priority::Visible)
+    }
+
+    fn begin_next_prioritized(
+        &mut self,
+        priority: impl Fn(&ThumbnailKey) -> Priority,
+    ) -> Option<ThumbnailKey> {
         if self.running >= MAX_THUMBNAIL_WORKERS {
             return None;
         }
-        let heavy = self.queued.iter().position(|(_, kind)| is_heavy(*kind));
-        let raster = self.queued.iter().position(|(_, kind)| !is_heavy(*kind));
+        let tier = self
+            .queued
+            .iter()
+            .filter(|(_, kind)| !is_heavy(*kind) || self.heavy_running < MAX_HEAVY_THUMBNAILS)
+            .map(|(key, _)| priority(key))
+            .filter(|priority| *priority <= Priority::Nearby)
+            .min()?;
+        let heavy = self
+            .queued
+            .iter()
+            .position(|(key, kind)| is_heavy(*kind) && priority(key) == tier)
+            .filter(|_| self.heavy_running < MAX_HEAVY_THUMBNAILS);
+        let raster = self
+            .queued
+            .iter()
+            .position(|(key, kind)| !is_heavy(*kind) && priority(key) == tier);
         let index = if let Some(heavy) = heavy
             .filter(|_| self.heavy_running < MAX_HEAVY_THUMBNAILS)
             .filter(|_| raster.is_none() || self.raster_burst >= MAX_RASTER_BURST)
@@ -361,12 +406,13 @@ impl ThumbnailQueue {
     }
 
     fn finish_key(&mut self, key: &ThumbnailKey) {
-        if let Some(kind) = self.active_kinds.remove(key)
-            && is_heavy(kind)
-        {
-            self.heavy_running = self.heavy_running.saturating_sub(1);
+        self.active_ids.remove(key);
+        if let Some(kind) = self.active_kinds.remove(key) {
+            if is_heavy(kind) {
+                self.heavy_running = self.heavy_running.saturating_sub(1);
+            }
+            self.running = self.running.saturating_sub(1);
         }
-        self.running = self.running.saturating_sub(1);
     }
 
     fn cancel(&mut self, key: &ThumbnailKey) {
@@ -464,11 +510,9 @@ fn set_thumbnail_for_path(request: ThumbnailRequest<'_>) {
         );
         return;
     };
-    if displayed_thumbnail_matches(request.image, request.path) {
-        return;
-    }
     let key = ThumbnailKey {
         path: path.clone(),
+        revision: None,
         modified: request.modified,
         file_size: request.file_size,
     };
@@ -476,6 +520,7 @@ fn set_thumbnail_for_path(request: ThumbnailRequest<'_>) {
         Some(CacheHit::Ready(ready)) => {
             let (image_id, _) = prepare_thumbnail_target(request.image, thumbnail_size);
             apply_thumbnail(request.image, &ready.texture, &path);
+            viewport::track(request.image, &path);
             ACTIVE_REQUESTS.with(|requests| {
                 requests.borrow_mut().remove(&image_id);
             });
@@ -492,14 +537,20 @@ fn set_thumbnail_for_path(request: ThumbnailRequest<'_>) {
         }
         None => {}
     }
-    let (image_id, request_id) = set_fallback_icon(
-        request.image,
-        Some(request.path),
-        request.fallback_icon,
-        request.icon_size,
-    );
+    let (image_id, request_id) = if displayed_thumbnail_matches(request.image, request.path) {
+        register_tracked_icon(request.image, request.path, request.fallback_icon, false);
+        prepare_thumbnail_target(request.image, thumbnail_size)
+    } else {
+        set_fallback_icon(
+            request.image,
+            Some(request.path),
+            request.fallback_icon,
+            request.icon_size,
+        )
+    };
     request.image.set_slot(thumbnail_size);
     let target = register_active_request(request.image, image_id, request_id);
+    viewport::track(request.image, &path);
     // Walking ancestors or hooking the viewport during bind can corrupt layout.
     glib::idle_add_local_once(move || {
         if request_is_live(&target) {
@@ -528,15 +579,8 @@ fn rect_eligible(
     viewport_width: f32,
     viewport_height: f32,
 ) -> bool {
-    let overscan = VIEWPORT_OVERSCAN;
-    width > 0.0
-        && height > 0.0
-        && viewport_width > 0.0
-        && viewport_height > 0.0
-        && x < viewport_width * (1.0 + overscan)
-        && x + width > -viewport_width * overscan
-        && y < viewport_height * (1.0 + overscan)
-        && y + height > -viewport_height * overscan
+    viewport::rect_priority(x, y, width, height, viewport_width, viewport_height)
+        < Priority::Deferred
 }
 
 fn group_address(viewport: Option<&gtk::ScrolledWindow>) -> usize {
@@ -545,49 +589,88 @@ fn group_address(viewport: Option<&gtk::ScrolledWindow>) -> usize {
 
 fn park_thumbnail(key: ThumbnailKey, kind: ThumbnailKind, target: PendingTarget) {
     crate::metrics::mark_thumbnail_requested();
-    let viewport = target.image.upgrade().and_then(|image| viewport_of(&image));
-    let group = group_address(viewport.as_ref());
-    let viewport_ref = glib::WeakRef::new();
-    if let Some(viewport) = &viewport {
-        viewport_ref.set(Some(viewport));
+    let viewports = target
+        .image
+        .upgrade()
+        .map(|image| viewport::ancestors(&image))
+        .unwrap_or_default();
+    for viewport in &viewports {
+        ensure_view_group(Some(viewport));
     }
+    let group = ensure_view_group(viewports.first());
     SETTLE_VIEWS.with(|views| {
         let mut views = views.borrow_mut();
-        let settle = views.entry(group).or_insert_with(|| ViewSettle {
-            viewport: viewport_ref.clone(),
-            pending: Vec::new(),
-            timer: None,
-            first_park: None,
-            hooked: false,
-        });
-        // A dead viewport's address may be recycled: reset the group instead of joining its stale hooks and pending requests.
-        if group != 0 && settle.viewport.upgrade().is_none() {
-            if let Some(timer) = settle.timer.take() {
-                timer.remove();
-            }
-            *settle = ViewSettle {
-                viewport: viewport_ref.clone(),
-                pending: Vec::new(),
-                timer: None,
-                first_park: None,
-                hooked: false,
-            };
-        }
+        let settle = views
+            .get_mut(&group)
+            .expect("registered thumbnail viewport");
         settle.pending.push(SettledPark { key, kind, target });
         if settle.first_park.is_none() {
             settle.first_park = Some(Instant::now());
         }
     });
-    if let Some(viewport) = viewport {
-        hook_viewport(group, &viewport);
-    }
     fire_view_group(group);
 }
 
-#[cfg(test)]
-fn schedule_or_defer(key: ThumbnailKey, kind: ThumbnailKind, target: PendingTarget) {
-    park_thumbnail(key, kind, target);
+fn ensure_view_group(viewport: Option<&gtk::ScrolledWindow>) -> usize {
+    let group = group_address(viewport);
+    let viewport_ref = glib::WeakRef::new();
+    viewport_ref.set(viewport);
+    let new_settle = || ViewSettle {
+        id: NEXT_REQUEST.fetch_add(1, Ordering::Relaxed),
+        scrolling: false,
+        frame_pending: false,
+        paint: viewport::PaintProgress::new(Instant::now()),
+        viewport: viewport_ref.clone(),
+        pending: Vec::new(),
+        timer: None,
+        first_park: None,
+        hooked: false,
+    };
+    SETTLE_VIEWS.with(|views| {
+        let mut views = views.borrow_mut();
+        let settle = views.entry(group).or_insert_with(&new_settle);
+        // A dead viewport's address may be recycled: reset the group instead of joining its stale hooks and pending requests.
+        if group != 0 && settle.viewport.upgrade().is_none() {
+            if let Some(timer) = settle.timer.take() {
+                timer.remove();
+            }
+            *settle = new_settle();
+        }
+    });
+    if let Some(viewport) = viewport {
+        hook_viewport(group, viewport);
+    }
+    group
 }
+
+pub(super) fn set_viewport_scrolling(viewport: &gtk::ScrolledWindow, scrolling: bool) {
+    let group = ensure_view_group(Some(viewport));
+    SETTLE_VIEWS.with(|views| {
+        if let Some(view) = views.borrow_mut().get_mut(&group) {
+            view.scrolling = scrolling;
+            if scrolling {
+                view.paint.reset(Instant::now());
+            }
+        }
+    });
+    start_thumbnail_jobs();
+    if !scrolling && crate::metrics::thumbnail_viewport_metrics_enabled() {
+        viewport.queue_draw();
+    }
+}
+
+fn viewport_admission_paused(viewport: &gtk::ScrolledWindow) -> bool {
+    SETTLE_VIEWS.with(|views| {
+        views
+            .borrow()
+            .get(&group_address(Some(viewport)))
+            .is_some_and(|view| {
+                view.viewport.upgrade().as_ref() == Some(viewport)
+                    && (view.scrolling || view.frame_pending)
+            })
+    })
+}
+
 fn mark_deferred(key: ThumbnailKey, kind: ThumbnailKind, image_id: usize, request: u64) {
     ACTIVE_REQUESTS.with(|requests| {
         if let Some(active) = requests
@@ -616,7 +699,39 @@ fn fire_delay(activity: ViewportActivity, overdue: bool) -> Duration {
 
 /// Fires happen only on the main loop: firing inside binds or adjustment callbacks can walk the
 /// widget tree while GTK is mutating it.
+// Adjustment values precede row allocation. Coalesce one frame wake per viewport;
+// only the subsequent idle pump may inspect bounds or dispatch work.
+fn request_frame_pump(group: usize) {
+    let viewport = SETTLE_VIEWS.with(|views| {
+        let mut views = views.borrow_mut();
+        let view = views.get_mut(&group)?;
+        if view.frame_pending {
+            return None;
+        }
+        let viewport = view.viewport.upgrade()?;
+        view.frame_pending = true;
+        Some((viewport, view.id))
+    });
+    if let Some((viewport, id)) = viewport {
+        viewport.add_tick_callback(move |_, _| {
+            let current = SETTLE_VIEWS.with(|views| {
+                let mut views = views.borrow_mut();
+                let Some(view) = views.get_mut(&group).filter(|view| view.id == id) else {
+                    return false;
+                };
+                view.frame_pending = false;
+                true
+            });
+            if current {
+                start_thumbnail_jobs();
+            }
+            glib::ControlFlow::Break
+        });
+    }
+}
+
 fn request_group_fire(group: usize, activity: ViewportActivity) {
+    request_frame_pump(group);
     SETTLE_VIEWS.with(|views| {
         let mut views = views.borrow_mut();
         let Some(settle) = views.get_mut(&group) else {
@@ -649,6 +764,7 @@ fn hook_viewport(group: usize, viewport: &gtk::ScrolledWindow) {
     if hooked {
         return;
     }
+    viewport::observe(viewport);
     for adjustment in [viewport.vadjustment(), viewport.hadjustment()] {
         adjustment.connect_value_changed(move |_| {
             request_group_fire(group, ViewportActivity::ValueChanged)
@@ -659,29 +775,22 @@ fn hook_viewport(group: usize, viewport: &gtk::ScrolledWindow) {
 }
 
 fn fire_view_group(group: usize) {
-    let (viewport, drained) = SETTLE_VIEWS.with(|views| {
+    let drained = SETTLE_VIEWS.with(|views| {
         let mut views = views.borrow_mut();
         let Some(settle) = views.get_mut(&group) else {
-            return (None, Vec::new());
+            return Vec::new();
         };
         if let Some(timer) = settle.timer.take() {
             timer.remove();
         }
         settle.first_park = None;
-        let viewport = settle.viewport.upgrade();
-        if group != 0 && viewport.is_none() {
+        if group != 0 && settle.viewport.upgrade().is_none() {
             views.remove(&group);
-            return (None, Vec::new());
+            return Vec::new();
         }
-        let drained = std::mem::take(&mut settle.pending);
-        (viewport, drained)
+        std::mem::take(&mut settle.pending)
     });
-    fire_parks(drained, viewport.as_ref());
-}
-
-#[cfg(test)]
-fn fire_settled_thumbnails() {
-    fire_view_group(0);
+    fire_parks(drained);
 }
 
 fn request_is_live(target: &PendingTarget) -> bool {
@@ -736,35 +845,18 @@ fn apply_live_thumbnail(target: PendingTarget, texture: gdk::Texture, path: Path
     crate::metrics::mark_thumbnail_applied();
 }
 
-fn fire_parks(drained: Vec<SettledPark>, _viewport: Option<&gtk::ScrolledWindow>) {
-    let mut eligible = 0;
-    let mut started = false;
+fn fire_parks(drained: Vec<SettledPark>) {
     for park in drained {
-        if !request_is_live(&park.target) {
-            continue;
-        }
-        eligible += 1;
-        if let Some(hit) = THUMBNAIL_CACHE.with(|cache| cache.borrow_mut().get(&park.key)) {
-            match hit {
-                CacheHit::Ready(ready) => {
-                    apply_live_thumbnail(park.target, ready.texture, park.key.path);
-                }
-                CacheHit::Failed => {}
-            }
-            continue;
-        }
-        let image_id = park.target.image_id;
-        let request = park.target.request;
-        if schedule_thumbnail(park.key.clone(), park.kind, park.target) {
-            started = true;
-        } else {
-            mark_deferred(park.key, park.kind, image_id, request);
+        if request_is_live(&park.target) {
+            mark_deferred(
+                park.key,
+                park.kind,
+                park.target.image_id,
+                park.target.request,
+            );
         }
     }
-    if started {
-        start_thumbnail_jobs();
-    }
-    crate::metrics::mark_thumbnail_eligible(eligible);
+    start_thumbnail_jobs();
 }
 
 fn schedule_thumbnail(key: ThumbnailKey, kind: ThumbnailKind, target: PendingTarget) -> bool {
@@ -775,6 +867,7 @@ fn schedule_thumbnail(key: ThumbnailKey, kind: ThumbnailKind, target: PendingTar
             true
         } else if let Some(pending) = pending.iter_mut().find_map(|(existing_key, pending)| {
             (existing_key.path == key.path
+                && existing_key.revision == key.revision
                 && (existing_key.modified.is_none()
                     || key.modified.is_none()
                     || existing_key.modified == key.modified))
@@ -789,7 +882,9 @@ fn schedule_thumbnail(key: ThumbnailKey, kind: ThumbnailKind, target: PendingTar
                 pending.insert(
                     key.clone(),
                     PendingThumbnail {
+                        queued_at: Instant::now(),
                         id: NEXT_REQUEST.fetch_add(1, Ordering::Relaxed),
+                        executing: false,
                         kind,
                         cancellation: Cancellation::default(),
                         targets: vec![target],
@@ -802,63 +897,236 @@ fn schedule_thumbnail(key: ThumbnailKey, kind: ThumbnailKind, target: PendingTar
 }
 
 fn start_thumbnail_jobs() {
-    while let Some(key) = LOOKUP_QUEUE.with(|queue| queue.borrow_mut().pop_front()) {
+    if !ACTIVE_REQUESTS.with(|requests| {
+        requests
+            .borrow()
+            .values()
+            .any(|active| active.image.upgrade().is_some())
+    }) {
+        return;
+    }
+    PIPELINE_PUMP.with(|pump| {
+        if pump.borrow().is_some() {
+            return;
+        }
+        *pump.borrow_mut() = Some(glib::idle_add_local_full(glib::Priority::LOW, || {
+            PIPELINE_PUMP.with(|pump| {
+                pump.borrow_mut().take();
+            });
+            pump_thumbnail_jobs();
+            glib::ControlFlow::Break
+        }));
+    });
+}
+
+fn pending_priority(key: &ThumbnailKey) -> Priority {
+    let targets = PENDING_THUMBNAILS.with(|pending| {
+        pending
+            .borrow()
+            .get(key)
+            .map(|pending| pending.targets.clone())
+            .unwrap_or_default()
+    });
+    targets
+        .iter()
+        .map(viewport::priority)
+        .min()
+        .unwrap_or(Priority::Deferred)
+}
+
+fn defer_pending(key: &ThumbnailKey) {
+    let pending = PENDING_THUMBNAILS.with(|pending| {
+        let mut pending = pending.borrow_mut();
+        if pending.get(key).is_none_or(|pending| pending.executing) {
+            return None;
+        }
+        pending.remove(key)
+    });
+    let Some(pending) = pending else {
+        return;
+    };
+    LOOKUP_QUEUE.with(|queue| queue.borrow_mut().retain(|queued| queued != key));
+    THUMBNAIL_QUEUE.with(|queue| queue.borrow_mut().cancel(key));
+    for target in pending.targets {
+        mark_deferred(key.clone(), pending.kind, target.image_id, target.request);
+    }
+}
+
+fn queued_priorities() -> Vec<(ThumbnailKey, Priority, Instant)> {
+    let queued = PENDING_THUMBNAILS.with(|pending| {
+        pending
+            .borrow()
+            .iter()
+            .filter(|(_, pending)| !pending.executing)
+            .map(|(key, pending)| (key.clone(), pending.queued_at))
+            .collect::<Vec<_>>()
+    });
+    queued
+        .into_iter()
+        .map(|(key, since)| {
+            let priority = pending_priority(&key);
+            (key, priority, since)
+        })
+        .collect()
+}
+
+fn next_lookup_key() -> Option<ThumbnailKey> {
+    if LOOKUP_ACTIVE.with(|active| active.borrow().len() >= MAX_LOOKUP_DISPATCH) {
+        return None;
+    }
+    let keys = LOOKUP_QUEUE.with(|queue| queue.borrow().iter().cloned().collect::<Vec<_>>());
+    let index = keys
+        .iter()
+        .enumerate()
+        .map(|(index, key)| (index, pending_priority(key)))
+        .filter(|(_, priority)| *priority <= Priority::Nearby)
+        .min_by_key(|(index, priority)| (*priority, *index))
+        .map(|(index, _)| index)?;
+    LOOKUP_QUEUE.with(|queue| queue.borrow_mut().remove(index))
+}
+
+fn pump_thumbnail_jobs() {
+    for (key, priority, _) in queued_priorities() {
+        if priority == Priority::Deferred {
+            defer_pending(&key);
+        }
+    }
+    retry_deferred_thumbnails();
+    while let Some(key) = next_lookup_key() {
         let retry_key = key.clone();
         let Some(job) = PENDING_THUMBNAILS.with(|pending| {
-            pending.borrow().get(&key).map(|pending| ThumbnailJob {
-                id: pending.id,
-                key,
-                kind: pending.kind,
-                cancellation: pending.cancellation.clone(),
+            pending.borrow_mut().get_mut(&key).map(|pending| {
+                pending.executing = true;
+                ThumbnailJob {
+                    id: pending.id,
+                    key,
+                    kind: pending.kind,
+                    cancellation: pending.cancellation.clone(),
+                }
             })
         }) else {
             continue;
         };
         crate::metrics::mark_thumbnail_started();
+        let queued_at = PENDING_THUMBNAILS.with(|pending| pending.borrow()[&job.key].queued_at);
+        let lookup_id = job.id;
+        LOOKUP_ACTIVE.with(|active| active.borrow_mut().insert(lookup_id));
         let lookup_job = job.clone();
         if decode::submit_owned(
             move || {
+                crate::metrics::record_thumbnail_stage(
+                    crate::metrics::ThumbnailStage::LookupWait,
+                    queued_at.elapsed(),
+                );
                 let started = Instant::now();
                 let key = resolve_source_key(&lookup_job.key);
-                let cached = key
-                    .modified
-                    .and_then(|mtime| super::thumbnail_cache::lookup(&key.path, mtime));
+                let cached = key.revision.and_then(|revision| {
+                    super::thumbnail_cache::lookup_revision(&key.path, revision)
+                });
                 crate::metrics::record_thumbnail_stage(
                     crate::metrics::ThumbnailStage::Lookup,
                     started.elapsed(),
                 );
                 LookupResult { key, cached }
             },
-            move |result| finish_thumbnail_lookup(job, result),
+            move |result| {
+                LOOKUP_ACTIVE.with(|active| active.borrow_mut().remove(&lookup_id));
+                finish_thumbnail_lookup(job, result);
+                start_thumbnail_jobs();
+            },
         )
         .is_err()
         {
+            PENDING_THUMBNAILS.with(|pending| {
+                if let Some(pending) = pending.borrow_mut().get_mut(&retry_key) {
+                    pending.executing = false;
+                }
+            });
+            LOOKUP_ACTIVE.with(|active| active.borrow_mut().remove(&lookup_id));
             LOOKUP_QUEUE.with(|queue| queue.borrow_mut().push_front(retry_key));
             break;
         }
     }
-    start_render_jobs();
+    dispatch_render_jobs();
 }
 
-fn start_render_jobs() {
-    while let Some(key) = THUMBNAIL_QUEUE.with(|queue| queue.borrow_mut().begin_next()) {
+fn visible_lookup_pending() -> bool {
+    let mut keys = LOOKUP_QUEUE.with(|queue| queue.borrow().iter().cloned().collect::<Vec<_>>());
+    LOOKUP_ACTIVE.with(|active| {
+        let active = active.borrow();
+        PENDING_THUMBNAILS.with(|pending| {
+            keys.extend(
+                pending
+                    .borrow()
+                    .iter()
+                    .filter(|(_, pending)| active.contains(&pending.id))
+                    .map(|(key, _)| key.clone()),
+            )
+        });
+    });
+    keys.iter()
+        .any(|key| pending_priority(key) == Priority::Visible)
+}
+
+fn dispatch_render_jobs() {
+    let visible_lookup = visible_lookup_pending();
+    let keys = THUMBNAIL_QUEUE.with(|queue| {
+        queue
+            .borrow()
+            .queued
+            .iter()
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>()
+    });
+    let priorities = keys
+        .into_iter()
+        .map(|key| {
+            let priority = pending_priority(&key);
+            // Do not fill every renderer with prefetch just before visible misses resolve.
+            let priority = if visible_lookup && priority == Priority::Nearby {
+                Priority::Paused
+            } else {
+                priority
+            };
+            (key, priority)
+        })
+        .collect::<HashMap<_, _>>();
+    while let Some(key) = THUMBNAIL_QUEUE.with(|queue| {
+        queue.borrow_mut().begin_next_prioritized(|key| {
+            priorities.get(key).copied().unwrap_or(Priority::Deferred)
+        })
+    }) {
         let Some(job) = PENDING_THUMBNAILS.with(|pending| {
-            pending.borrow().get(&key).map(|pending| ThumbnailJob {
-                id: pending.id,
-                key: key.clone(),
-                kind: pending.kind,
-                cancellation: pending.cancellation.clone(),
+            pending.borrow_mut().get_mut(&key).map(|pending| {
+                pending.executing = true;
+                ThumbnailJob {
+                    id: pending.id,
+                    key: key.clone(),
+                    kind: pending.kind,
+                    cancellation: pending.cancellation.clone(),
+                }
             })
         }) else {
             THUMBNAIL_QUEUE.with(|queue| queue.borrow_mut().finish_key(&key));
             continue;
         };
         crate::metrics::mark_thumbnail_started();
+        THUMBNAIL_QUEUE.with(|queue| queue.borrow_mut().active_ids.insert(key.clone(), job.id));
+        let queued_at = PENDING_THUMBNAILS.with(|pending| pending.borrow()[&job.key].queued_at);
         let render_kind = job.kind;
         let render_job = job.clone();
-        if decode::submit_owned(
+        if decode::submit_render(
             move || {
+                crate::metrics::record_thumbnail_stage(
+                    crate::metrics::ThumbnailStage::RenderWait,
+                    queued_at.elapsed(),
+                );
                 let started = Instant::now();
+                if !source_matches(&render_job.key) {
+                    return Err(crate::sandbox::ThumbnailError::Service(
+                        "Thumbnail source changed before rendering".to_owned(),
+                    ));
+                }
                 let result = render_thumbnail(
                     &render_job.key.path,
                     render_job.kind,
@@ -869,12 +1137,22 @@ fn start_render_jobs() {
                     crate::metrics::ThumbnailStage::Render,
                     started.elapsed(),
                 );
+                if !source_matches(&render_job.key) {
+                    return Err(crate::sandbox::ThumbnailError::Service(
+                        "Thumbnail source changed while rendering".to_owned(),
+                    ));
+                }
                 result
             },
             move |result| finish_thumbnail_render(job, result),
         )
         .is_err()
         {
+            PENDING_THUMBNAILS.with(|pending| {
+                if let Some(pending) = pending.borrow_mut().get_mut(&key) {
+                    pending.executing = false;
+                }
+            });
             THUMBNAIL_QUEUE
                 .with(|queue| queue.borrow_mut().push_front_kind(key.clone(), render_kind));
             THUMBNAIL_QUEUE.with(|queue| queue.borrow_mut().finish_key(&key));
@@ -884,22 +1162,20 @@ fn start_render_jobs() {
 }
 
 fn resolve_source_key(key: &ThumbnailKey) -> ThumbnailKey {
-    let Ok(metadata) = std::fs::metadata(&key.path) else {
+    let Ok(revision) = crate::sandbox::SourceRevision::read(&key.path) else {
         return key.clone();
     };
-    if !metadata.is_file() {
-        return key.clone();
-    }
-    let modified = metadata
-        .modified()
-        .ok()
-        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-        .and_then(|duration| i64::try_from(duration.as_secs()).ok());
     ThumbnailKey {
         path: key.path.clone(),
-        modified: key.modified.or(modified),
-        file_size: key.file_size.or(Some(metadata.len())),
+        revision: Some(revision),
+        modified: Some(revision.modified),
+        file_size: Some(revision.size),
     }
+}
+
+fn source_matches(key: &ThumbnailKey) -> bool {
+    key.revision
+        .is_some_and(|revision| revision.matches(&key.path))
 }
 
 fn rekey_pending_thumbnail(job: &ThumbnailJob, key: ThumbnailKey) -> Option<ThumbnailJob> {
@@ -915,12 +1191,7 @@ fn rekey_pending_thumbnail(job: &ThumbnailJob, key: ThumbnailKey) -> Option<Thum
         let current = pending.remove(&job.key)?;
         if let Some(existing) = pending.get_mut(&key) {
             existing.targets.extend(current.targets);
-            return Some(ThumbnailJob {
-                id: existing.id,
-                key,
-                kind: existing.kind,
-                cancellation: existing.cancellation.clone(),
-            });
+            return None;
         }
         let id = current.id;
         pending.insert(key.clone(), current);
@@ -943,13 +1214,41 @@ fn finish_thumbnail_lookup(mut job: ThumbnailJob, result: LookupResult) {
     if !pending_thumbnail_matches(&job.key, job.id) {
         return;
     }
+    if let Some(hit) = THUMBNAIL_CACHE.with(|cache| cache.borrow_mut().get(&job.key)) {
+        match hit {
+            CacheHit::Ready(ready) => {
+                if let Some(targets) = take_pending_targets(&job.key, job.id) {
+                    finish_thumbnail_targets(targets, Some(&ready.texture), &job.key.path);
+                }
+                settle_thumbnail_pipeline();
+            }
+            CacheHit::Failed => finish_thumbnail_failure(job, false),
+        }
+        return;
+    }
     if let Some(png) = cached {
         crate::metrics::mark_thumbnail_lookup_hit();
         let completion_png = png.clone();
         let completion_job = job.clone();
-        if decode::submit(png, move |decoded| {
-            finish_thumbnail_decode(completion_job, completion_png, false, decoded);
-        })
+        let decode_key = job.key.clone();
+        if decode::submit_owned(
+            move || {
+                let decoded = decode::decode_png(png);
+                if source_matches(&decode_key) {
+                    decoded
+                } else {
+                    Err("Thumbnail source changed during lookup".to_owned())
+                }
+            },
+            move |decoded| {
+                finish_thumbnail_decode(
+                    completion_job,
+                    crate::sandbox::ThumbnailRender::Png(completion_png),
+                    false,
+                    decoded,
+                );
+            },
+        )
         .is_err()
         {
             finish_thumbnail_failure(job, false);
@@ -957,8 +1256,22 @@ fn finish_thumbnail_lookup(mut job: ThumbnailJob, result: LookupResult) {
         return;
     }
     crate::metrics::mark_thumbnail_lookup_miss();
+    let interested = PENDING_THUMBNAILS.with(|pending| {
+        let mut pending = pending.borrow_mut();
+        let Some(current) = pending.get_mut(&job.key) else {
+            return false;
+        };
+        current.queued_at = Instant::now();
+        current.executing = false;
+        !current.targets.is_empty()
+    });
+    if !interested {
+        take_pending_targets(&job.key, job.id);
+        settle_thumbnail_pipeline();
+        return;
+    }
     if THUMBNAIL_QUEUE.with(|queue| queue.borrow_mut().enqueue_kind(job.key.clone(), job.kind)) {
-        start_render_jobs();
+        start_thumbnail_jobs();
     } else {
         finish_thumbnail_failure(job, false);
     }
@@ -966,45 +1279,55 @@ fn finish_thumbnail_lookup(mut job: ThumbnailJob, result: LookupResult) {
 
 fn finish_thumbnail_render(
     job: ThumbnailJob,
-    result: Result<crate::sandbox::ThumbnailRender, String>,
+    result: Result<crate::sandbox::ThumbnailRender, crate::sandbox::ThumbnailError>,
 ) {
     match result {
-        Ok(crate::sandbox::ThumbnailRender::Png(png)) => {
-            let completion_png = png.clone();
+        Ok(render) => {
+            let completion_render = render.clone();
             let completion_job = job.clone();
-            if decode::submit(png, move |decoded| {
-                finish_thumbnail_decode(completion_job, completion_png, true, decoded);
-            })
+            let decode_key = job.key.clone();
+            if decode::submit_owned(
+                move || {
+                    let decoded = match render {
+                        crate::sandbox::ThumbnailRender::Png(png) => decode::decode_png(png),
+                        crate::sandbox::ThumbnailRender::Raw {
+                            pixels,
+                            width,
+                            height,
+                            stride,
+                        } => decode::decode_raw(pixels, width, height, stride),
+                    };
+                    if source_matches(&decode_key) {
+                        decoded
+                    } else {
+                        Err("Thumbnail source changed before display".to_owned())
+                    }
+                },
+                move |decoded| {
+                    finish_thumbnail_decode(completion_job, completion_render, true, decoded)
+                },
+            )
             .is_err()
             {
                 finish_thumbnail_failure(job, true);
             }
         }
-        Ok(crate::sandbox::ThumbnailRender::Raw {
-            pixels,
-            width,
-            height,
-            stride,
-        }) => {
-            let completion_job = job.clone();
-            if decode::submit_raw(pixels, width, height, stride, move |result| match result {
-                Ok((decoded, png)) => {
-                    finish_thumbnail_decode(completion_job, png, true, Ok(decoded));
-                }
-                Err(_) => finish_thumbnail_failure(completion_job, true),
-            })
-            .is_err()
-            {
-                finish_thumbnail_failure(job, true);
+        Err(crate::sandbox::ThumbnailError::Content) => {
+            if pending_thumbnail_matches(&job.key, job.id) {
+                THUMBNAIL_CACHE.with(|cache| cache.borrow_mut().insert_failure(job.key.clone()));
             }
+            finish_thumbnail_failure(job, true);
         }
-        Err(_) => finish_thumbnail_failure(job, true),
+        Err(crate::sandbox::ThumbnailError::Service(error)) => {
+            tracing::debug!(%error, "thumbnail service failure");
+            finish_thumbnail_failure(job, true);
+        }
     }
 }
 
 fn finish_thumbnail_decode(
     job: ThumbnailJob,
-    png: Vec<u8>,
+    render: crate::sandbox::ThumbnailRender,
     rendered: bool,
     decoded: Result<decode::DecodedTexture, String>,
 ) {
@@ -1012,7 +1335,7 @@ fn finish_thumbnail_decode(
         Ok(decoded) => {
             let targets = take_pending_targets(&job.key, job.id);
             if rendered {
-                finish_thumbnail_slot(&job.key);
+                finish_thumbnail_slot(&job.key, job.id);
             }
             if let Some(targets) = targets {
                 crate::metrics::mark_thumbnail_completed();
@@ -1024,8 +1347,8 @@ fn finish_thumbnail_decode(
                     );
                 });
                 finish_thumbnail_targets(targets, Some(&decoded.texture), &job.key.path);
-                if rendered && let Some(mtime) = job.key.modified {
-                    enqueue_persist(job.key.path.clone(), mtime, png);
+                if rendered && let Some(revision) = job.key.revision {
+                    enqueue_persist(job.key.path.clone(), revision, render);
                 }
             }
         }
@@ -1044,8 +1367,25 @@ fn finish_thumbnail_decode(
 }
 
 fn finish_thumbnail_render_again(job: ThumbnailJob) {
+    let interested = PENDING_THUMBNAILS.with(|pending| {
+        let mut pending = pending.borrow_mut();
+        let Some(current) = pending
+            .get_mut(&job.key)
+            .filter(|current| current.id == job.id)
+        else {
+            return false;
+        };
+        current.queued_at = Instant::now();
+        current.executing = false;
+        !current.targets.is_empty()
+    });
+    if !interested {
+        take_pending_targets(&job.key, job.id);
+        settle_thumbnail_pipeline();
+        return;
+    }
     if THUMBNAIL_QUEUE.with(|queue| queue.borrow_mut().enqueue_kind(job.key.clone(), job.kind)) {
-        start_render_jobs();
+        start_thumbnail_jobs();
     } else {
         finish_thumbnail_failure(job, false);
     }
@@ -1067,54 +1407,69 @@ fn pending_thumbnail_matches(key: &ThumbnailKey, job_id: u64) -> bool {
 fn finish_thumbnail_failure(job: ThumbnailJob, render_admitted: bool) {
     let targets = take_pending_targets(&job.key, job.id);
     if render_admitted {
-        finish_thumbnail_slot(&job.key);
+        finish_thumbnail_slot(&job.key, job.id);
     }
     if let Some(targets) = targets {
         crate::metrics::mark_thumbnail_cancelled();
-        THUMBNAIL_CACHE.with(|cache| cache.borrow_mut().insert_failure(job.key.clone()));
+        // Service failures and abandoned executions are not evidence of invalid content.
         finish_thumbnail_targets(targets, None, &job.key.path);
     }
     settle_thumbnail_pipeline();
 }
 
-fn finish_thumbnail_slot(key: &ThumbnailKey) {
-    THUMBNAIL_QUEUE.with(|queue| queue.borrow_mut().finish_key(key));
+fn finish_thumbnail_slot(key: &ThumbnailKey, id: u64) {
+    THUMBNAIL_QUEUE.with(|queue| {
+        let mut queue = queue.borrow_mut();
+        if queue.active_ids.get(key) == Some(&id) {
+            queue.finish_key(key);
+        }
+    });
 }
 
 fn settle_thumbnail_pipeline() {
     start_thumbnail_jobs();
-    retry_deferred_thumbnails();
     let counts = crate::metrics::thumbnail_counts();
     tracing::debug!(?counts, "thumbnail pipeline settled");
 }
 
 fn retry_deferred_thumbnails() {
-    let mut promoted = false;
-    loop {
-        // ponytail: deferred work is bounded by live GTK image widgets; add an explicit cap if a
-        // future non-virtualized producer can create an unbounded number of them.
-        let deferred = ACTIVE_REQUESTS.with(|requests| {
-            let mut requests = requests.borrow_mut();
-            requests.retain(|_, active| active.image.upgrade().is_some());
-            requests
-                .iter()
-                .filter_map(|(image_id, active)| {
-                    active.deferred.as_ref().map(|deferred| {
-                        (*image_id, active.id, active.image.clone(), deferred.clone())
-                    })
+    let deferred = ACTIVE_REQUESTS.with(|requests| {
+        let mut requests = requests.borrow_mut();
+        requests.retain(|_, active| active.image.upgrade().is_some());
+        requests
+            .iter()
+            .filter_map(|(image_id, active)| {
+                active.deferred.as_ref().map(|deferred| {
+                    (
+                        PendingTarget {
+                            image_id: *image_id,
+                            request: active.id,
+                            image: active.image.clone(),
+                        },
+                        deferred.clone(),
+                    )
                 })
-                .min_by_key(|(_, request, _, _)| *request)
-        });
-        let Some((image_id, request, image, deferred)) = deferred else {
-            break;
-        };
-        if !retry_deferred_thumbnail(image_id, request, image, deferred) {
-            break;
+            })
+            .collect::<Vec<_>>()
+    });
+    let mut eligible = deferred
+        .into_iter()
+        .map(|(target, deferred)| (viewport::priority(&target), target, deferred))
+        .filter(|(priority, _, _)| *priority <= Priority::Nearby)
+        .collect::<Vec<_>>();
+    eligible.sort_by_key(|(priority, target, _)| (*priority, target.request));
+    for (priority, target, deferred) in eligible {
+        if PENDING_THUMBNAILS.with(|pending| pending.borrow().len() >= MAX_QUEUED_THUMBNAILS)
+            && let Some((key, _, _)) = queued_priorities()
+                .into_iter()
+                .filter(|(_, queued_priority, _)| *queued_priority > priority)
+                .max_by_key(|(_, priority, since)| (*priority, *since))
+        {
+            defer_pending(&key);
         }
-        promoted = true;
-    }
-    if promoted {
-        start_thumbnail_jobs();
+        if retry_deferred_thumbnail(target.image_id, target.request, target.image, deferred) {
+            crate::metrics::mark_thumbnail_eligible(1);
+        }
     }
 }
 
@@ -1172,6 +1527,24 @@ fn finish_thumbnail_targets(
             ACTIVE_REQUESTS.with(|requests| {
                 requests.borrow_mut().remove(&target.image_id);
             });
+            if let Some(image) = target.image.upgrade()
+                && displayed_thumbnail_matches(&image, path)
+            {
+                let icon = TRACKED_CUSTOMIZED_ICONS
+                    .with(|icons| {
+                        icons
+                            .borrow()
+                            .iter()
+                            .find(|tracked| {
+                                tracked.path == path
+                                    && tracked.image.upgrade().as_ref() == Some(&image)
+                            })
+                            .map(|tracked| tracked.icon.clone())
+                    })
+                    .unwrap_or_else(|| crate::assets::icons::PICTURES.to_owned());
+                clear_displayed_thumbnail(&image);
+                apply_path_customization(&image, path, &icon);
+            }
             continue;
         };
         apply_live_thumbnail(target, texture.clone(), path.to_path_buf());
@@ -1192,14 +1565,12 @@ fn apply_thumbnail(image: &ThumbnailSlot, texture: &gdk::Texture, path: &Path) {
 }
 
 fn displayed_thumbnail_matches(image: &ThumbnailSlot, path: &Path) -> bool {
-    TRACKED_THUMBNAILS.with(|thumbnails| {
-        let mut thumbnails = thumbnails.borrow_mut();
-        thumbnails.retain(|tracked| tracked.image.upgrade().is_some());
-        thumbnails
-            .iter()
-            .find(|tracked| tracked.image.upgrade().as_ref() == Some(image))
-            .is_some_and(|tracked| tracked.path == path)
-    })
+    image.texture().is_some()
+        && TRACKED_THUMBNAILS.with(|thumbnails| {
+            thumbnails.borrow().iter().any(|tracked| {
+                tracked.path == path && tracked.image.upgrade().as_ref() == Some(image)
+            })
+        })
 }
 
 fn register_displayed_thumbnail(image: &ThumbnailSlot, path: &Path) {
@@ -1231,6 +1602,28 @@ fn clear_displayed_thumbnail(image: &ThumbnailSlot) {
                 .is_some_and(|tracked_image| tracked_image != *image)
         });
     });
+}
+
+pub(super) fn show_deferred_thumbnail_or_icon(
+    image: &ThumbnailSlot,
+    entry: &FileEntry,
+    icon: &str,
+    size: i32,
+) {
+    let path = entry.local_thumbnail_path();
+    if !entry.is_directory()
+        && thumbnail_kind(Path::new(&entry.display_name)).is_some()
+        && let Some(path) = path
+        && displayed_thumbnail_matches(image, path)
+        && super::theme::ThemeManager::shared()
+            .custom_icon(path)
+            .is_none()
+    {
+        cancel_thumbnail(image.as_ptr() as usize);
+        image.set_slot(size);
+    } else {
+        set_fallback_icon(image, path, icon, size);
+    }
 }
 
 pub(super) fn show_fallback_icon(image: &ThumbnailSlot, icon: &str, size: i32) {
@@ -1272,6 +1665,7 @@ pub(super) fn cancel_list_item_thumbnails(item: &glib::Object) {
 
 pub(super) fn cancel_thumbnails_in(widget: &gtk::Widget) {
     if let Some(image) = widget.downcast_ref::<ThumbnailSlot>() {
+        viewport::untrack(image);
         cancel_thumbnail(image.as_ptr() as usize);
     }
     let mut child = widget.first_child();
@@ -1296,6 +1690,7 @@ fn set_fallback_icon(
     size: i32,
 ) -> (usize, u64) {
     let ids = prepare_thumbnail_target(image, size);
+    viewport::untrack(image);
     clear_displayed_thumbnail(image);
     let (texture, customized) = path_icon_texture(path, icon);
     image.set_fallback(icon, texture.as_ref());
@@ -1434,8 +1829,11 @@ fn refresh_tracked_icons(matches: impl Fn(&TrackedCustomizedIcon) -> bool) {
             .collect::<Vec<_>>()
     });
     for (image, path, icon) in pending {
-        cancel_thumbnail(image.as_ptr() as usize);
         let customized = apply_path_customization(&image, &path, &icon);
+        if customized {
+            viewport::untrack(&image);
+            cancel_thumbnail(image.as_ptr() as usize);
+        }
         TRACKED_CUSTOMIZED_ICONS.with(|icons| {
             let Ok(mut icons) = icons.try_borrow_mut() else {
                 return;
@@ -1470,6 +1868,9 @@ fn cancel_thumbnail(image_id: usize) {
                 .targets
                 .retain(|target| target.image_id != image_id);
             if thumbnail.targets.is_empty() {
+                if thumbnail.executing {
+                    return true;
+                }
                 thumbnail.cancellation.cancel();
                 cancelled.push(key.clone());
                 false
@@ -1481,11 +1882,12 @@ fn cancel_thumbnail(image_id: usize) {
     });
     THUMBNAIL_QUEUE.with(|queue| {
         let mut queue = queue.borrow_mut();
-        for key in cancelled {
-            queue.cancel(&key);
+        for key in &cancelled {
+            queue.cancel(key);
         }
     });
-    retry_deferred_thumbnails();
+    LOOKUP_QUEUE.with(|queue| queue.borrow_mut().retain(|key| !cancelled.contains(key)));
+    start_thumbnail_jobs();
 }
 
 fn is_heavy(kind: ThumbnailKind) -> bool {
@@ -1525,7 +1927,7 @@ fn render_thumbnail(
     kind: ThumbnailKind,
     size: i32,
     cancellation: &Cancellation,
-) -> Result<crate::sandbox::ThumbnailRender, String> {
+) -> Result<crate::sandbox::ThumbnailRender, crate::sandbox::ThumbnailError> {
     if let Some(operation) = persistent_pool_operation(kind) {
         return crate::sandbox::render_persistent_thumbnail(
             path,
@@ -1541,7 +1943,7 @@ fn render_thumbnail(
         ThumbnailKind::RawImage => ParseOperation::ThumbnailRaw,
         ThumbnailKind::Video => ParseOperation::ThumbnailVideo,
     };
-    crate::sandbox::retire_idle_thumbnail_worker_for_oneshot();
+    let _resident = crate::sandbox::reserve_thumbnail_oneshot()?;
     crate::sandbox::parse(
         path,
         operation,
@@ -1550,6 +1952,7 @@ fn render_thumbnail(
         cancellation,
     )
     .map(|output| crate::sandbox::ThumbnailRender::Png(output.data))
+    .map_err(crate::sandbox::ThumbnailError::Service)
 }
 
 #[cfg(test)]
@@ -1574,12 +1977,14 @@ pub(super) fn hold_thumbnail_workers() {
 
 #[cfg(test)]
 pub(super) fn clear_thumbnail_runtime() {
-    crate::sandbox::shutdown_thumbnail_worker_pool();
-    THUMBNAIL_QUEUE.with(|queue| {
-        let mut queue = queue.borrow_mut();
-        queue.running = 0;
-        queue.queued.clear();
+    PIPELINE_PUMP.with(|pump| {
+        if let Some(source) = pump.borrow_mut().take() {
+            source.remove();
+        }
     });
+    LOOKUP_ACTIVE.with(|active| active.borrow_mut().clear());
+    viewport::clear();
+    THUMBNAIL_QUEUE.with(|queue| *queue.borrow_mut() = ThumbnailQueue::default());
     PENDING_THUMBNAILS.with(|pending| pending.borrow_mut().clear());
     LOOKUP_QUEUE.with(|queue| queue.borrow_mut().clear());
     ACTIVE_REQUESTS.with(|requests| requests.borrow_mut().clear());

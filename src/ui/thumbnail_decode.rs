@@ -6,11 +6,11 @@ use std::sync::{
     mpsc::{Receiver, SyncSender, TrySendError, sync_channel},
 };
 
-use gtk::{gdk, gdk_pixbuf, glib, prelude::*};
+use gtk::{gdk, glib, prelude::*};
 
 const WORKER_COUNT: usize = 2;
-/// This queue is shared by lookup, decode, render, and persistence submissions. The
-/// thumbnail request table supplies the single global 64-entry pipeline bound.
+/// Each lane is bounded; the thumbnail request table supplies the global 64-entry
+/// lookup/render bound, and persistence has its own best-effort 32-entry queue.
 const MAX_QUEUED_DECODES: usize = 64;
 const MAX_QUEUED_COMPLETIONS: usize = MAX_QUEUED_DECODES + WORKER_COUNT;
 const MAX_TEXTURE_EDGE: i32 = 512;
@@ -58,17 +58,17 @@ impl CompletionBridge {
     }
 
     fn drain(self: Arc<Self>) {
-        loop {
-            while let Some(completion) = self.try_recv() {
-                completion();
-            }
-            self.scheduled.store(false, Ordering::Release);
-            match self.try_recv() {
-                Some(completion) => {
-                    self.scheduled.store(true, Ordering::Release);
-                    completion();
-                }
-                None => break,
+        for _ in 0..16 {
+            let Some(completion) = self.try_recv() else {
+                break;
+            };
+            completion();
+        }
+        self.scheduled.store(false, Ordering::Release);
+        if let Some(completion) = self.try_recv() {
+            completion();
+            if !self.scheduled.swap(true, Ordering::AcqRel) {
+                glib::idle_add_once(move || self.drain());
             }
         }
     }
@@ -88,14 +88,19 @@ struct DecodeExecutor {
 }
 
 impl DecodeExecutor {
+    #[cfg(test)]
     fn new() -> Self {
+        Self::with_workers(WORKER_COUNT, "test")
+    }
+
+    fn with_workers(count: usize, name: &str) -> Self {
         let (sender, receiver) = sync_channel::<DecodeJob>(MAX_QUEUED_DECODES);
         let receiver = Arc::new(Mutex::new(receiver));
         let completions = CompletionBridge::new();
-        for index in 0..WORKER_COUNT {
+        for index in 0..count {
             let receiver = receiver.clone();
             std::thread::Builder::new()
-                .name(format!("strata-thumb-exec-{index}"))
+                .name(format!("strata-thumb-{name}-{index}"))
                 .spawn(move || worker_loop(&receiver))
                 .expect("thumbnail decode worker should start");
         }
@@ -128,7 +133,7 @@ fn worker_loop(receiver: &Mutex<Receiver<DecodeJob>>) {
 
 fn executor() -> &'static DecodeExecutor {
     static EXECUTOR: OnceLock<DecodeExecutor> = OnceLock::new();
-    EXECUTOR.get_or_init(DecodeExecutor::new)
+    EXECUTOR.get_or_init(|| DecodeExecutor::with_workers(WORKER_COUNT, "lookup"))
 }
 
 fn submit_work<R>(
@@ -138,7 +143,14 @@ fn submit_work<R>(
 where
     R: Send + 'static,
 {
-    let executor = executor();
+    submit_on(executor(), work, completion)
+}
+
+fn submit_on<R: Send + 'static>(
+    executor: &DecodeExecutor,
+    work: impl FnOnce() -> R + Send + 'static,
+    completion: impl FnOnce(R) + Send + 'static,
+) -> Result<(), String> {
     let completions = executor.completions.clone();
     executor
         .submit(DecodeJob {
@@ -150,43 +162,20 @@ where
         .map_err(|_| "thumbnail executor queue is full".to_owned())
 }
 
+#[cfg(test)]
 pub(super) fn submit(
     png: Vec<u8>,
     completion: impl FnOnce(Result<DecodedTexture, String>) + Send + 'static,
 ) -> Result<(), String> {
-    submit_work(
-        move || {
-            let started = std::time::Instant::now();
-            let result = decode_png(png);
-            crate::metrics::record_thumbnail_stage(
-                crate::metrics::ThumbnailStage::ParentDecode,
-                started.elapsed(),
-            );
-            result
-        },
-        completion,
-    )
+    submit_work(move || decode_png(png), completion)
 }
 
-pub(super) fn submit_raw(
+pub(super) fn decode_raw(
     pixels: Vec<u8>,
     width: i32,
     height: i32,
     stride: usize,
-    completion: impl FnOnce(Result<(DecodedTexture, Vec<u8>), String>) + Send + 'static,
-) -> Result<(), String> {
-    submit_work(
-        move || decode_raw(pixels, width, height, stride),
-        completion,
-    )
-}
-
-fn decode_raw(
-    pixels: Vec<u8>,
-    width: i32,
-    height: i32,
-    stride: usize,
-) -> Result<(DecodedTexture, Vec<u8>), String> {
+) -> Result<DecodedTexture, String> {
     if width <= 0 || height <= 0 || width > MAX_TEXTURE_EDGE || height > MAX_TEXTURE_EDGE {
         return Err("thumbnail decoded outside the supported dimensions".to_owned());
     }
@@ -204,25 +193,10 @@ fn decode_raw(
     let texture =
         gdk::MemoryTexture::new(width, height, gdk::MemoryFormat::R8g8b8a8, &bytes, stride)
             .upcast();
-    let pixbuf = gdk_pixbuf::Pixbuf::from_bytes(
-        &bytes,
-        gdk_pixbuf::Colorspace::Rgb,
-        true,
-        8,
-        width,
-        height,
-        i32::try_from(stride).map_err(|_| "thumbnail stride overflowed")?,
-    );
-    let png = pixbuf
-        .save_to_bufferv("png", &[])
-        .map_err(|error| error.to_string())?;
-    Ok((
-        DecodedTexture {
-            texture,
-            byte_len: required,
-        },
-        png,
-    ))
+    Ok(DecodedTexture {
+        texture,
+        byte_len: required,
+    })
 }
 
 pub(super) fn submit_owned<R>(
@@ -235,7 +209,41 @@ where
     submit_work(work, completion)
 }
 
-fn decode_png(png: Vec<u8>) -> Result<DecodedTexture, String> {
+pub(super) fn submit_render<R: Send + 'static>(
+    work: impl FnOnce() -> R + Send + 'static,
+    completion: impl FnOnce(R) + Send + 'static,
+) -> Result<(), String> {
+    static RENDER: OnceLock<DecodeExecutor> = OnceLock::new();
+    submit_on(
+        RENDER.get_or_init(|| DecodeExecutor::with_workers(crate::sandbox::RENDER_LIMIT, "render")),
+        work,
+        completion,
+    )
+}
+
+pub(super) fn submit_persist<R: Send + 'static>(
+    work: impl FnOnce() -> R + Send + 'static,
+    completion: impl FnOnce(R) + Send + 'static,
+) -> Result<(), String> {
+    static PERSIST: OnceLock<DecodeExecutor> = OnceLock::new();
+    submit_on(
+        PERSIST.get_or_init(|| DecodeExecutor::with_workers(1, "persist")),
+        work,
+        completion,
+    )
+}
+
+pub(super) fn decode_png(png: Vec<u8>) -> Result<DecodedTexture, String> {
+    let started = std::time::Instant::now();
+    let result = decode_png_pixels(png);
+    crate::metrics::record_thumbnail_stage(
+        crate::metrics::ThumbnailStage::ParentDecode,
+        started.elapsed(),
+    );
+    result
+}
+
+fn decode_png_pixels(png: Vec<u8>) -> Result<DecodedTexture, String> {
     // gdk4 0.11 marks textures Send + Sync and its GDK initialization check is a no-op.
     // Full codec parsing is still an unsandboxed S3 trust-boundary limitation.
     let encoded = glib::Bytes::from_owned(png);
